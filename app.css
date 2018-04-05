@@ -1,0 +1,49 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  font-family: Helvetica, Arial, sans-serif;
+  min-height: 100%;
+  display: grid;
+  grid-template-rows: 1fr auto;
+}
+
+header {
+  background: #f0293e;
+  color: #fff;
+  text-align: center;
+}
+main {
+  background: #ffffff;
+  min-height: 80vh;
+}
+
+.controls {
+  text-align: center;
+  padding: 0.5em 0;
+  background: #333e5a;
+}
+
+video {
+  width: 100%;
+  max-width: 600px;
+  display: block;
+  margin: 0 auto;
+}
+
+footer {
+  background: #333e5a;
+  color: #fff;
+  text-align: center;
+}
+
+footer a {
+  color: #fff;
+}

@@ -2,7 +2,11 @@
 
 An example of using the [mediaDevices](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices) API to choose a user's camera.
 
-## View the project
+## See it in action
+
+You can test this project by [visiting it online here](https://philnash.github.io/mediadevices-camera-selection/).
+
+## Run the project yourself
 
 You should run this project on a local web server. I like to use [serve](https://www.npmjs.com/package/serve) for this, but you can do so as you choose.
 

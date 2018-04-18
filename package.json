@@ -1,0 +1,24 @@
+{
+  "name": "camera-choice",
+  "version": "1.0.0",
+  "description": "Example code to show selecting cameras with JavaScript",
+  "main": "app.js",
+  "scripts": {
+    "start": "serve ."
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/philnash/mediadevices-camera-selection.git"
+  },
+  "keywords": ["webrtc", "getUserMedia"],
+  "author": "Phil Nash <philnash@twilio.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/philnash/mediadevices-camera-selection/issues"
+  },
+  "homepage":
+    "https://github.com/philnash/mediadevices-camera-selection#readme",
+  "devDependencies": {
+    "serve": "^6.5.5"
+  }
+}

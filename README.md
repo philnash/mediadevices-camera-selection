@@ -2,6 +2,8 @@
 
 An example of using the [mediaDevices](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices) API to choose a user's camera.
 
+📖 Read about how the code works in this blog post on [choosing cameras in JavaScript with the `mediaDevices` API](https://www.twilio.com/blog/2018/04/choosing-cameras-javascript-mediadevices-api.html).
+
 ## See it in action
 
 You can test this project by [visiting it online here](https://philnash.github.io/mediadevices-camera-selection/).

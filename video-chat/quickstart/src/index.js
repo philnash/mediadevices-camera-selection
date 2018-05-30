@@ -97,14 +97,12 @@ function updateVideoDevice(event) {
   const select = document.getElementById('video-devices');
   const localParticipant = room.localParticipant;
   if (select.value !== '') {
-
-
     Video.createLocalVideoTrack({
-      video: { deviceId: { exact: select.value }}
+      deviceId: { exact: select.value }
     }).then(function(localVideoTrack) {
       const tracks = Array.from(localParticipant.videoTracks.values());
       localParticipant.unpublishTracks(tracks);
-      localParticipant.publishTrack(localVideoTrack).then(console.log).catch(console.error);
+      localParticipant.publishTrack(localVideoTrack);
     });
   }
 }

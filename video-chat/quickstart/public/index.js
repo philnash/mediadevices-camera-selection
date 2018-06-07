@@ -31123,7 +31123,13 @@ function updateVideoDevice(event) {
     }).then(function(localVideoTrack) {
       const tracks = Array.from(localParticipant.videoTracks.values());
       localParticipant.unpublishTracks(tracks);
+      log(localParticipant.identity + " removed track: " + tracks[0].kind);
+      detachTracks(tracks);
+
       localParticipant.publishTrack(localVideoTrack);
+      log(localParticipant.identity + " added track: " + localVideoTrack.kind);
+      const previewContainer = document.getElementById('local-media');
+      attachTracks([localVideoTrack], previewContainer);
     });
   }
 }
@@ -31170,17 +31176,6 @@ function roomJoined(room) {
     log(participant.identity + " removed track: " + track.kind);
     detachTracks([track]);
   });
-
-  room.localParticipant.on('trackRemoved', function(track) {
-    log(room.localParticipant.identity + " removed track: " + track.kind);
-    detachTracks([track]);
-  });
-
-  room.localParticipant.on('trackAdded', function(track) {
-    log(room.localParticipant.identity + " added track: " + track.kind);
-    var previewContainer = document.getElementById('local-media');
-    attachTracks([track], previewContainer);
-  })
 
   // When a Participant leaves the Room, detach its Tracks.
   room.on('participantDisconnected', function(participant) {

@@ -31115,7 +31115,7 @@ function gotDevices(mediaDevices) {
 }
 
 function updateVideoDevice(event) {
-  const select = document.getElementById('video-devices');
+  const select = event.target;
   const localParticipant = room.localParticipant;
   if (select.value !== '') {
     Video.createLocalVideoTrack({

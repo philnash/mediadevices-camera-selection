@@ -6,7 +6,7 @@
   "scripts": {
     "build:quickstart": "watchify quickstart/src/index.js -o quickstart/public/index.js",
     "clean:quickstart": "rimraf quickstart/public/index.js",
-    "start": "concurrently \"npm run clean:quickstart && npm run build:quickstart\" \"node server\""
+    "start": "npm run clean:quickstart && concurrently \"npm run build:quickstart\" \"node server\""
   },
   "repository": {
     "type": "git",

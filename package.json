@@ -1,24 +1,43 @@
 {
   "name": "camera-choice",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Example code to show selecting cameras with JavaScript",
-  "main": "app.js",
+  "main": "index.js",
   "scripts": {
-    "start": "serve ."
+    "build:quickstart": "watchify video-chat/quickstart/src/index.js -o video-chat/quickstart/public/index.js",
+    "clean:quickstart": "rimraf video-chat/quickstart/public/index.js",
+    "start": "npm run clean:quickstart && concurrently \"npm run build:quickstart\" \"node video-chat/server\"",
+    "serve": "serve ."
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/philnash/mediadevices-camera-selection.git"
   },
-  "keywords": ["webrtc", "getUserMedia"],
+  "keywords": [
+    "webrtc",
+    "getUserMedia"
+  ],
   "author": "Phil Nash <philnash@twilio.com>",
   "license": "MIT",
   "bugs": {
     "url": "https://github.com/philnash/mediadevices-camera-selection/issues"
   },
-  "homepage":
-    "https://github.com/philnash/mediadevices-camera-selection#readme",
+  "homepage": "https://github.com/philnash/mediadevices-camera-selection#readme",
+  "dependencies": {
+    "dotenv": "^4.0.0",
+    "express": "^4.15.2",
+    "prismjs": "^1.6.0",
+    "stackblur-canvas": "^1.4.0",
+    "twilio": "^3.0.0-rc.16",
+    "twilio-video": "^1.3.0"
+  },
   "devDependencies": {
+    "browserify": "^14.3.0",
+    "concurrently": "^3.5.1",
+    "copyfiles": "^1.2.0",
+    "npm-run-all": "^4.0.2",
+    "rimraf": "^2.6.1",
+    "watchify": "^3.11.0",
     "serve": "^6.5.5"
   }
 }

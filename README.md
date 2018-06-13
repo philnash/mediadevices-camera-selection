@@ -30,7 +30,7 @@ If you want to use serve, you can install and use it with npm like so:
 
 ```bash
 npm install
-npm start
+npm run serve
 ```
 
 The page will be available at [localhost:5000/index.html](http://localhost:5000/index.html).

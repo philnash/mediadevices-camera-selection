@@ -35,6 +35,24 @@ function detachParticipantTracks(participant) {
   detachTracks(tracks);
 }
 
+function gotDevices(mediaDevices) {
+  const select = document.getElementById('video-devices');
+  select.innerHTML = '';
+  select.appendChild(document.createElement('option'));
+  let count = 1;
+  mediaDevices.forEach(mediaDevice => {
+    if (mediaDevice.kind === 'videoinput') {
+      const option = document.createElement('option');
+      option.value = mediaDevice.deviceId;
+      const label = mediaDevice.label || `Camera ${count++}`;
+      const textNode = document.createTextNode(label);
+      option.appendChild(textNode);
+      select.appendChild(option);
+    }
+  });
+}
+
+
 // When we are about to transition away from this page, disconnect
 // from the room, if joined.
 window.addEventListener('beforeunload', leaveRoomIfJoined);
@@ -76,9 +94,35 @@ $.getJSON('/token', function(data) {
   };
 });
 
+function updateVideoDevice(event) {
+  const select = event.target;
+  const localParticipant = room.localParticipant;
+  if (select.value !== '') {
+    Video.createLocalVideoTrack({
+      deviceId: { exact: select.value }
+    }).then(function(localVideoTrack) {
+      const tracks = Array.from(localParticipant.videoTracks.values());
+      localParticipant.unpublishTracks(tracks);
+      log(localParticipant.identity + " removed track: " + tracks[0].kind);
+      detachTracks(tracks);
+
+      localParticipant.publishTrack(localVideoTrack);
+      log(localParticipant.identity + " added track: " + localVideoTrack.kind);
+      const previewContainer = document.getElementById('local-media');
+      attachTracks([localVideoTrack], previewContainer);
+    });
+
+  }
+}
+
+
 // Successfully connected!
 function roomJoined(room) {
   window.room = activeRoom = room;
+
+  navigator.mediaDevices.enumerateDevices().then(gotDevices);
+  const select = document.getElementById('video-devices');
+  select.addEventListener('change', updateVideoDevice);
 
   log("Joined as '" + identity + "'");
   document.getElementById('button-join').style.display = 'none';
@@ -135,6 +179,7 @@ function roomJoined(room) {
     activeRoom = null;
     document.getElementById('button-join').style.display = 'inline';
     document.getElementById('button-leave').style.display = 'none';
+    select.removeEventListener('change', updateVideoDevice);
   });
 }
 

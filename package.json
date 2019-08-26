@@ -29,7 +29,7 @@
     "prismjs": "^1.15.0",
     "stackblur-canvas": "^1.4.0",
     "twilio": "^3.26.1",
-    "twilio-video": "^1.14.2"
+    "twilio-video": "2.0.0-beta12"
   },
   "devDependencies": {
     "browserify": "^14.3.0",

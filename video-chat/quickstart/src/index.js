@@ -10,28 +10,40 @@ var roomName;
 // Attach the Tracks to the DOM.
 function attachTracks(tracks, container) {
   tracks.forEach(function(track) {
-    container.appendChild(track.attach());
+    if (track) {
+      container.appendChild(track.attach());
+    }
   });
 }
 
 // Attach the Participant's Tracks to the DOM.
 function attachParticipantTracks(participant, container) {
-  var tracks = Array.from(participant.tracks.values());
+  var tracks = Array.from(participant.tracks.values()).map(function(
+    trackPublication
+  ) {
+    return trackPublication.track;
+  });
   attachTracks(tracks, container);
 }
 
 // Detach the Tracks from the DOM.
 function detachTracks(tracks) {
   tracks.forEach(function(track) {
-    track.detach().forEach(function(detachedElement) {
-      detachedElement.remove();
-    });
+    if (track) {
+      track.detach().forEach(function(detachedElement) {
+        detachedElement.remove();
+      });
+    }
   });
 }
 
 // Detach the Participant's Tracks from the DOM.
 function detachParticipantTracks(participant) {
-  var tracks = Array.from(participant.tracks.values());
+  var tracks = Array.from(participant.tracks.values()).map(function(
+    trackPublication
+  ) {
+    return trackPublication.track;
+  });
   detachTracks(tracks);
 }
 
@@ -51,7 +63,6 @@ function gotDevices(mediaDevices) {
     }
   });
 }
-
 
 // When we are about to transition away from this page, disconnect
 // from the room, if joined.
@@ -101,20 +112,22 @@ function updateVideoDevice(event) {
     Video.createLocalVideoTrack({
       deviceId: { exact: select.value }
     }).then(function(localVideoTrack) {
-      const tracks = Array.from(localParticipant.videoTracks.values());
+      const tracks = Array.from(localParticipant.videoTracks.values()).map(
+        function(trackPublication) {
+          return trackPublication.track;
+        }
+      );
       localParticipant.unpublishTracks(tracks);
-      log(localParticipant.identity + " removed track: " + tracks[0].kind);
+      log(localParticipant.identity + ' removed track: ' + tracks[0].kind);
       detachTracks(tracks);
 
       localParticipant.publishTrack(localVideoTrack);
-      log(localParticipant.identity + " added track: " + localVideoTrack.kind);
+      log(localParticipant.identity + ' added track: ' + localVideoTrack.kind);
       const previewContainer = document.getElementById('local-media');
       attachTracks([localVideoTrack], previewContainer);
     });
-
   }
 }
-
 
 // Successfully connected!
 function roomJoined(room) {
@@ -147,15 +160,15 @@ function roomJoined(room) {
   });
 
   // When a Participant adds a Track, attach it to the DOM.
-  room.on('trackAdded', function(track, participant) {
-    log(participant.identity + " added track: " + track.kind);
+  room.on('trackSubscribed', function(track, trackPublication, participant) {
+    log(participant.identity + ' added track: ' + track.kind);
     var previewContainer = document.getElementById('remote-media');
     attachTracks([track], previewContainer);
   });
 
   // When a Participant removes a Track, detach it from the DOM.
-  room.on('trackRemoved', function(track, participant) {
-    log(participant.identity + " removed track: " + track.kind);
+  room.on('trackUnsubscribed', function(track, trackPublication, participant) {
+    log(participant.identity + ' removed track: ' + track.kind);
     detachTracks([track]);
   });
 
@@ -169,6 +182,7 @@ function roomJoined(room) {
   // of all Participants, including that of the LocalParticipant.
   room.on('disconnected', function() {
     log('Left');
+
     if (previewTracks) {
       previewTracks.forEach(function(track) {
         track.stop();
@@ -189,16 +203,19 @@ document.getElementById('button-preview').onclick = function() {
     ? Promise.resolve(previewTracks)
     : Video.createLocalTracks();
 
-  localTracksPromise.then(function(tracks) {
-    window.previewTracks = previewTracks = tracks;
-    var previewContainer = document.getElementById('local-media');
-    if (!previewContainer.querySelector('video')) {
-      attachTracks(tracks, previewContainer);
+  localTracksPromise.then(
+    function(tracks) {
+      window.previewTracks = previewTracks = tracks;
+      var previewContainer = document.getElementById('local-media');
+      if (!previewContainer.querySelector('video')) {
+        attachTracks(tracks, previewContainer);
+      }
+    },
+    function(error) {
+      console.error('Unable to access local media', error);
+      log('Unable to access Camera and Microphone');
     }
-  }, function(error) {
-    console.error('Unable to access local media', error);
-    log('Unable to access Camera and Microphone');
-  });
+  );
 };
 
 // Activity log.

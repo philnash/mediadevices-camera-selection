@@ -64,6 +64,13 @@ function gotDevices(mediaDevices) {
   });
 }
 
+// 
+function stopTracks(tracks) {
+  tracks.forEach(function(track) {
+    if (track) { track.stop(); }
+  })
+}
+
 // When we are about to transition away from this page, disconnect
 // from the room, if joined.
 window.addEventListener('beforeunload', leaveRoomIfJoined);
@@ -107,20 +114,20 @@ $.getJSON('/token', function(data) {
 
 function updateVideoDevice(event) {
   const select = event.target;
-  const localParticipant = room.localParticipant;
+  const localParticipant = activeRoom.localParticipant;
   if (select.value !== '') {
+    const tracks = Array.from(localParticipant.videoTracks.values()).map(
+      function(trackPublication) {
+        return trackPublication.track;
+      }
+    );
+    localParticipant.unpublishTracks(tracks);
+    log(localParticipant.identity + ' removed track: ' + tracks[0].kind);
+    detachTracks(tracks);
+    stopTracks(tracks);
     Video.createLocalVideoTrack({
       deviceId: { exact: select.value }
     }).then(function(localVideoTrack) {
-      const tracks = Array.from(localParticipant.videoTracks.values()).map(
-        function(trackPublication) {
-          return trackPublication.track;
-        }
-      );
-      localParticipant.unpublishTracks(tracks);
-      log(localParticipant.identity + ' removed track: ' + tracks[0].kind);
-      detachTracks(tracks);
-
       localParticipant.publishTrack(localVideoTrack);
       log(localParticipant.identity + ' added track: ' + localVideoTrack.kind);
       const previewContainer = document.getElementById('local-media');

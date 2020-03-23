@@ -3,16 +3,16 @@
 
 var flatMap = require('./util').flatMap;
 var guessBrowser = require('./util').guessBrowser;
+var guessBrowserVersion = require('./util').guessBrowserVersion;
 var getSdpFormat = require('./util/sdp').getSdpFormat;
 
 var guess = guessBrowser();
+var guessVersion = guessBrowserVersion();
 var isChrome = guess === 'chrome';
 var isFirefox = guess === 'firefox';
 var isSafari = guess === 'safari';
 
-var chromeMajorVersion = isChrome
-  ? parseInt(navigator.userAgent.match(/Chrome\/([0-9]+)/)[1], 10)
-  : null;
+var chromeMajorVersion = isChrome ? guessVersion.major : null;
 
 var CHROME_LEGACY_MAX_AUDIO_LEVEL = 32767;
 
@@ -935,6 +935,10 @@ function ChromeRTCPeerConnection(configuration, constraints) {
   var peerConnection = new RTCPeerConnection(newConfiguration, constraints);
 
   Object.defineProperties(this, {
+    _appliedTracksToSSRCs: {
+      value: new Map(),
+      writable: true
+    },
     _localStream: {
       value: new MediaStream()
     },
@@ -949,6 +953,10 @@ function ChromeRTCPeerConnection(configuration, constraints) {
       value: null,
       writable: true
     },
+    _rolledBackTracksToSSRCs: {
+      value: new Map(),
+      writable: true
+    },
     _sdpFormat: {
       value: sdpFormat
     },
@@ -959,7 +967,8 @@ function ChromeRTCPeerConnection(configuration, constraints) {
       value: new Latch()
     },
     _tracksToSSRCs: {
-      value: new Map()
+      value: new Map(),
+      writable: true
     },
     localDescription: {
       enumerable: true,
@@ -994,6 +1003,9 @@ function ChromeRTCPeerConnection(configuration, constraints) {
   });
 
   peerConnection.addEventListener('signalingstatechange', function onsignalingstatechange() {
+    if (peerConnection.signalingState === 'stable') {
+      self._appliedTracksToSSRCs = new Map(self._tracksToSSRCs);
+    }
     if (!self._pendingLocalOffer && !self._pendingRemoteOffer) {
       self.dispatchEvent.apply(self, arguments);
     }
@@ -1133,6 +1145,11 @@ ChromeRTCPeerConnection.prototype.createAnswer = function createAnswer() {
       return self._peerConnection.createAnswer();
     }).then(function createAnswerSucceeded(answer) {
       self._pendingRemoteOffer = null;
+
+      // NOTE(mmalavalli): If createAnswer() is called immediately after rolling back, then we no
+      // longer need to retain the rolled back tracks to SSRCs Map.
+      self._rolledBackTracksToSSRCs.clear();
+
       return new ChromeRTCSessionDescription({
         type: 'answer',
         sdp: updateTrackIdsToSSRCs(self._sdpFormat, self._tracksToSSRCs, answer.sdp)
@@ -1143,6 +1160,10 @@ ChromeRTCPeerConnection.prototype.createAnswer = function createAnswer() {
     });
   } else {
     promise = this._peerConnection.createAnswer().then(function(answer) {
+      // NOTE(mmalavalli): If createAnswer() is called immediately after rolling back, then we no
+      // longer need to retain the rolled back tracks to SSRCs Map.
+      self._rolledBackTracksToSSRCs.clear();
+
       return new ChromeRTCSessionDescription({
         type: 'answer',
         sdp: updateTrackIdsToSSRCs(self._sdpFormat, self._tracksToSSRCs, answer.sdp)
@@ -1161,6 +1182,10 @@ ChromeRTCPeerConnection.prototype.createOffer = function createOffer() {
   var self = this;
 
   var promise = this._peerConnection.createOffer(options).then(function(offer) {
+    // NOTE(mmalavalli): If createOffer() is called immediately after rolling back, then we no
+    // longer need to retain the rolled back tracks to SSRCs Map.
+    self._rolledBackTracksToSSRCs.clear();
+
     return new ChromeRTCSessionDescription({
       type: offer.type,
       sdp: updateTrackIdsToSSRCs(self._sdpFormat, self._tracksToSSRCs, offer.sdp)
@@ -1182,6 +1207,14 @@ ChromeRTCPeerConnection.prototype.createDataChannel = function createDataChannel
 ChromeRTCPeerConnection.prototype.setLocalDescription = function setLocalDescription() {
   var args = [].slice.call(arguments);
   var description = args[0];
+
+  // NOTE(mmalavalli): If setLocalDescription() is called immediately after rolling back,
+  // then we need to restore the rolled back tracks to SSRCs Map.
+  if (this._rolledBackTracksToSSRCs.size > 0) {
+    this._tracksToSSRCs = new Map(this._rolledBackTracksToSSRCs);
+    this._rolledBackTracksToSSRCs.clear();
+  }
+
   var promise = setDescription(this, true, description);
   return args.length > 1
     ? util.legacyPromise(promise, args[1], args[2])
@@ -1191,6 +1224,11 @@ ChromeRTCPeerConnection.prototype.setLocalDescription = function setLocalDescrip
 ChromeRTCPeerConnection.prototype.setRemoteDescription = function setRemoteDescription() {
   var args = [].slice.call(arguments);
   var description = args[0];
+
+  // NOTE(mmalavalli): If setRemoteDescription() is called immediately after rolling back,
+  // then we no longer need to retain the rolled back tracks to SSRCs Map.
+  this._rolledBackTracksToSSRCs.clear();
+
   var promise = setDescription(this, false, description);
   return args.length > 1
     ? util.legacyPromise(promise, args[1], args[2])
@@ -1233,7 +1271,6 @@ function setDescription(peerConnection, local, description) {
 
   if (!local && pendingRemoteOffer && description.type === 'answer') {
     promise = setRemoteAnswer(peerConnection, description);
-
   } else if (description.type === 'offer') {
     if (peerConnection.signalingState !== intermediateState && peerConnection.signalingState !== 'stable') {
       // NOTE(mroberts): Error message copied from Firefox.
@@ -1267,6 +1304,14 @@ function setDescription(peerConnection, local, description) {
     } else {
       // Reset the pending offer.
       clearPendingLocalOffer();
+
+      // NOTE(mmalavalli): We store the rolled back tracks to SSRCs Map here in case
+      // setLocalDescription() is called immediately after a rollback (without calling
+      // createOffer() or createAnswer()), in which case this roll back is not due to a
+      // glare scenario and this Map should be restored.
+      peerConnection._rolledBackTracksToSSRCs = new Map(peerConnection._tracksToSSRCs);
+      peerConnection._tracksToSSRCs = new Map(peerConnection._appliedTracksToSSRCs);
+
       promise = Promise.resolve();
       promise.then(function dispatchSignalingStateChangeEvent() {
         peerConnection.dispatchEvent(new Event('signalingstatechange'));
@@ -1370,7 +1415,7 @@ function updateTrackIdsToSSRCs(sdpFormat, tracksToSSRCs, sdp) {
 
 module.exports = ChromeRTCPeerConnection;
 
-},{"../mediastream":4,"../rtcrtpsender":11,"../rtcsessiondescription/chrome":12,"../util":16,"../util/eventtarget":15,"../util/latch":17,"../util/sdp":18,"util":154}],8:[function(require,module,exports){
+},{"../mediastream":4,"../rtcrtpsender":11,"../rtcsessiondescription/chrome":12,"../util":16,"../util/eventtarget":15,"../util/latch":17,"../util/sdp":18,"util":167}],8:[function(require,module,exports){
 /* globals RTCPeerConnection */
 'use strict';
 
@@ -1703,26 +1748,24 @@ function overwriteWithInitiallyNegotiatedDtlsRole(description, dtlsRole) {
 
 module.exports = FirefoxRTCPeerConnection;
 
-},{"../rtcsessiondescription/firefox":13,"../util":16,"../util/eventtarget":15,"../util/sdp":18,"util":154}],9:[function(require,module,exports){
+},{"../rtcsessiondescription/firefox":13,"../util":16,"../util/eventtarget":15,"../util/sdp":18,"util":167}],9:[function(require,module,exports){
 'use strict';
 
-var guessBrowser = require('../util').guessBrowser;
-
-switch (guessBrowser()) {
-  case 'chrome':
-    module.exports = require('./chrome');
-    break;
-  case 'firefox':
-    module.exports = require('./firefox');
-    break;
-  case 'safari':
-    module.exports = require('./safari');
-    break;
-  default:
-    if (typeof RTCPeerConnection === 'undefined') {
+if (typeof RTCPeerConnection !== 'undefined') {
+  var guessBrowser = require('../util').guessBrowser;
+  switch (guessBrowser()) {
+    case 'chrome':
+      module.exports = require('./chrome');
       break;
-    }
-    module.exports = RTCPeerConnection;
+    case 'firefox':
+      module.exports = require('./firefox');
+      break;
+    case 'safari':
+      module.exports = require('./safari');
+      break;
+    default:
+      module.exports = RTCPeerConnection;
+  }
 }
 
 },{"../util":16,"./chrome":7,"./firefox":8,"./safari":10}],10:[function(require,module,exports){
@@ -1756,6 +1799,10 @@ function SafariRTCPeerConnection(configuration) {
   var peerConnection = new RTCPeerConnection(configuration);
 
   Object.defineProperties(this, {
+    _appliedTracksToSSRCs: {
+      value: new Map(),
+      writable: true
+    },
     _audioTransceiver: {
       value: null,
       writable: true
@@ -1775,11 +1822,16 @@ function SafariRTCPeerConnection(configuration) {
       value: null,
       writable: true
     },
+    _rolledBackTracksToSSRCs: {
+      value: new Map(),
+      writable: true
+    },
     _signalingStateLatch: {
       value: new Latch()
     },
     _tracksToSSRCs: {
-      value: new Map()
+      value: new Map(),
+      writable: true
     },
     _videoTransceiver: {
       value: null,
@@ -1842,6 +1894,9 @@ function SafariRTCPeerConnection(configuration) {
     if (self._isClosed) {
       return;
     }
+    if (peerConnection.signalingState === 'stable') {
+      self._appliedTracksToSSRCs = new Map(self._tracksToSSRCs);
+    }
     if (!self._pendingLocalOffer && !self._pendingRemoteOffer) {
       self.dispatchEvent.apply(self, arguments);
     }
@@ -1900,6 +1955,10 @@ SafariRTCPeerConnection.prototype.createOffer = function createOffer(options) {
   }
 
   return this._peerConnection.createOffer(options).then(function(offer) {
+    // NOTE(mmalavalli): If createOffer() is called immediately after rolling back,
+    // then we no longer need to retain the rolled back tracks to SSRCs Map.
+    self._rolledBackTracksToSSRCs.clear();
+
     return new RTCSessionDescription({
       type: offer.type,
       sdp: updateTrackIdsToSSRCs(self._tracksToSSRCs, offer.sdp)
@@ -1916,6 +1975,11 @@ SafariRTCPeerConnection.prototype.createAnswer = function createAnswer(options) 
       return self._peerConnection.createAnswer();
     }).then(function createAnswerSucceeded(answer) {
       self._pendingRemoteOffer = null;
+
+      // NOTE(mmalavalli): If createAnswer() is called immediately after rolling back, then we no
+      // longer need to retain the rolled back tracks to SSRCs Map.
+      self._rolledBackTracksToSSRCs.clear();
+
       return isUnifiedPlan ? new RTCSessionDescription({
         type: answer.type,
         sdp: updateTrackIdsToSSRCs(self._tracksToSSRCs, answer.sdp)
@@ -1927,6 +1991,10 @@ SafariRTCPeerConnection.prototype.createAnswer = function createAnswer(options) 
   }
 
   return this._peerConnection.createAnswer(options).then(function createAnswerSucceeded(answer) {
+    // NOTE(mmalavalli): If createAnswer() is called immediately after rolling back, then we no
+    // longer need to retain the rolled back tracks to SSRCs Map.
+    self._rolledBackTracksToSSRCs.clear();
+
     return isUnifiedPlan ? new RTCSessionDescription({
       type: answer.type,
       sdp: updateTrackIdsToSSRCs(self._tracksToSSRCs, answer.sdp)
@@ -1946,10 +2014,19 @@ SafariRTCPeerConnection.prototype.removeTrack = function removeTrack(sender) {
 };
 
 SafariRTCPeerConnection.prototype.setLocalDescription = function setLocalDescription(description) {
+  // NOTE(mmalavalli): If setLocalDescription() is called immediately after rolling back,
+  // then we need to restore the rolled back tracks to SSRCs Map.
+  if (this._rolledBackTracksToSSRCs.size > 0) {
+    this._tracksToSSRCs = new Map(this._rolledBackTracksToSSRCs);
+    this._rolledBackTracksToSSRCs.clear();
+  }
   return setDescription(this, true, description);
 };
 
 SafariRTCPeerConnection.prototype.setRemoteDescription = function setRemoteDescription(description) {
+  // NOTE(mmalavalli): If setRemoteDescription() is called immediately after rolling back,
+  // then we no longer need to retain the rolled back tracks to SSRCs Map.
+  this._rolledBackTracksToSSRCs.clear();
   return setDescription(this, false, description);
 };
 
@@ -2021,6 +2098,14 @@ function setDescription(peerConnection, local, description) {
         (local ? 'local' : 'remote') + ' description in ' + peerConnection.signalingState));
     }
     clearPendingLocalOffer();
+
+    // NOTE(mmalavalli): We store the rolled back tracks to SSRCs Map here in case
+    // setLocalDescription() is called immediately aftera rollback (without calling
+    // createOffer() or createAnswer()), in which case this roll back is not due to
+    // a glare scenario and this Map should be restored.
+    peerConnection._rolledBackTracksToSSRCs = new Map(peerConnection._tracksToSSRCs);
+    peerConnection._tracksToSSRCs = new Map(peerConnection._appliedTracksToSSRCs);
+
     return Promise.resolve().then(function dispatchSignalingStateChangeEvent() {
       peerConnection.dispatchEvent(new Event('signalingstatechange'));
     });
@@ -2074,7 +2159,7 @@ function shimDataChannel(dataChannel) {
 
 module.exports = SafariRTCPeerConnection;
 
-},{"../util":16,"../util/eventtarget":15,"../util/latch":17,"../util/sdp":18,"util":154}],11:[function(require,module,exports){
+},{"../util":16,"../util/eventtarget":15,"../util/latch":17,"../util/sdp":18,"util":167}],11:[function(require,module,exports){
 'use strict';
 
 /**
@@ -2157,12 +2242,11 @@ function ChromeRTCSessionDescription(descriptionInitDict) {
 module.exports = ChromeRTCSessionDescription;
 
 },{}],13:[function(require,module,exports){
-/* globals mozRTCSessionDescription, RTCSessionDescription */
+/* globals RTCSessionDescription */
 'use strict';
-
 module.exports = typeof RTCSessionDescription !== 'undefined'
   ? RTCSessionDescription
-  : mozRTCSessionDescription;
+  : window.mozRTCSessionDescription;
 
 },{}],14:[function(require,module,exports){
 'use strict';
@@ -2224,7 +2308,7 @@ EventTarget.prototype.removeEventListener = function removeEventListener() {
 
 module.exports = EventTarget;
 
-},{"events":155}],16:[function(require,module,exports){
+},{"events":168}],16:[function(require,module,exports){
 'use strict';
 
 /**
@@ -2332,22 +2416,65 @@ function flatMap(list, mapFn) {
 }
 
 /**
+ * Get the browser's user agent, if available.
+ * @returns {?string}
+ */
+function getUserAgent() {
+  return typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string'
+    ? navigator.userAgent
+    : null;
+}
+
+/**
  * Guess the browser.
+ * @param {string} [userAgent=navigator.userAgent]
  * @returns {?string} browser - "chrome", "firefox", "safari", or null
  */
-function guessBrowser() {
-  if (typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string') {
-    if (/Chrome/.test(navigator.userAgent)) {
-      return 'chrome';
-    }
-    if (/Firefox/.test(navigator.userAgent)) {
-      return 'firefox';
-    }
-    if (/Safari/.test(navigator.userAgent)) {
-      return 'safari';
-    }
+function guessBrowser(userAgent) {
+  if (typeof userAgent === 'undefined') {
+    userAgent = getUserAgent();
+  }
+  if (/Chrome|CriOS/.test(userAgent)) {
+    return 'chrome';
+  }
+  if (/Firefox|FxiOS/.test(userAgent)) {
+    return 'firefox';
+  }
+  if (/Safari/.test(userAgent)) {
+    return 'safari';
   }
   return null;
+}
+
+/**
+ * Guess the browser version.
+ * @param {string} [userAgent=navigator.userAgent]
+ * @returns {?{major: number, minor: number}}
+ */
+function guessBrowserVersion(userAgent) {
+  if (typeof userAgent === 'undefined') {
+    userAgent = getUserAgent();
+  }
+  var prefix = {
+    chrome: 'Chrome|CriOS',
+    firefox: 'Firefox|FxiOS',
+    safari: 'Version'
+  }[guessBrowser(userAgent)];
+
+  if (!prefix) {
+    return null;
+  }
+  var regex = new RegExp('(' + prefix + ')/([^\\s]+)');
+  var match = (userAgent.match(regex) || [])[2];
+
+  if (!match) {
+    return null;
+  }
+  var versions = match.split('.').map(Number);
+  return {
+    major: isNaN(versions[0]) ? null : versions[0],
+    minor: isNaN(versions[1]) ? null : versions[1]
+  };
 }
 
 /**
@@ -2468,6 +2595,7 @@ exports.delegateMethods = delegateMethods;
 exports.difference = difference;
 exports.flatMap = flatMap;
 exports.guessBrowser = guessBrowser;
+exports.guessBrowserVersion = guessBrowserVersion;
 exports.interceptEvent = interceptEvent;
 exports.legacyPromise = legacyPromise;
 exports.makeUUID = makeUUID;
@@ -2900,29 +3028,29 @@ exports.updateUnifiedPlanTrackIdsToSSRCs = updateUnifiedPlanTrackIdsToSSRCs;
 
 },{"./":16}],19:[function(require,module,exports){
 module.exports={
-  "_from": "@twilio/webrtc@4.1.0",
-  "_id": "@twilio/webrtc@4.1.0",
+  "_from": "@twilio/webrtc@4.2.0",
+  "_id": "@twilio/webrtc@4.2.0",
   "_inBundle": false,
-  "_integrity": "sha512-Tk6HhTxeThmb/vsZDu5yD8gbFXyRBdKypFRA/VGgxCkDQNqEFqsX8mmYRF1YvzOF7P/mhZ+t871zdAPzJvZ3aQ==",
+  "_integrity": "sha512-MmxRVuQtKSKqSsspe9cGuhIH+p7EuEhainHXvdys8QdFbBpnRkGuQKNwwiNzwf+9DcTvlw1B32q3TDgyfqopKw==",
   "_location": "/@twilio/webrtc",
   "_phantomChildren": {},
   "_requested": {
     "type": "version",
     "registry": true,
-    "raw": "@twilio/webrtc@4.1.0",
+    "raw": "@twilio/webrtc@4.2.0",
     "name": "@twilio/webrtc",
     "escapedName": "@twilio%2fwebrtc",
     "scope": "@twilio",
-    "rawSpec": "4.1.0",
+    "rawSpec": "4.2.0",
     "saveSpec": null,
-    "fetchSpec": "4.1.0"
+    "fetchSpec": "4.2.0"
   },
   "_requiredBy": [
     "/twilio-video"
   ],
-  "_resolved": "https://registry.npmjs.org/@twilio/webrtc/-/webrtc-4.1.0.tgz",
-  "_shasum": "fc7663d0957042acd911570800b0c51eaf6c5cb3",
-  "_spec": "@twilio/webrtc@4.1.0",
+  "_resolved": "https://registry.npmjs.org/@twilio/webrtc/-/webrtc-4.2.0.tgz",
+  "_shasum": "f4978ca807116536b5ffcb5e56b5ff076cb5eebb",
+  "_spec": "@twilio/webrtc@4.2.0",
   "_where": "/Users/pnash/projects/mediadevices-camera-selection/node_modules/twilio-video",
   "author": {
     "name": "Manjesh Malavalli",
@@ -2990,10 +3118,457 @@ module.exports={
     "test:integration:native": "karma start karma/integration.conf.js",
     "test:unit": "istanbul cover node_modules/mocha/bin/_mocha -- ./test/unit/index.js"
   },
-  "version": "4.1.0"
+  "version": "4.2.0"
 }
 
 },{}],20:[function(require,module,exports){
+//      Copyright (c) 2012 Mathieu Turcotte
+//      Licensed under the MIT license.
+
+var Backoff = require('./lib/backoff');
+var ExponentialBackoffStrategy = require('./lib/strategy/exponential');
+var FibonacciBackoffStrategy = require('./lib/strategy/fibonacci');
+var FunctionCall = require('./lib/function_call.js');
+
+module.exports.Backoff = Backoff;
+module.exports.FunctionCall = FunctionCall;
+module.exports.FibonacciStrategy = FibonacciBackoffStrategy;
+module.exports.ExponentialStrategy = ExponentialBackoffStrategy;
+
+// Constructs a Fibonacci backoff.
+module.exports.fibonacci = function(options) {
+    return new Backoff(new FibonacciBackoffStrategy(options));
+};
+
+// Constructs an exponential backoff.
+module.exports.exponential = function(options) {
+    return new Backoff(new ExponentialBackoffStrategy(options));
+};
+
+// Constructs a FunctionCall for the given function and arguments.
+module.exports.call = function(fn, vargs, callback) {
+    var args = Array.prototype.slice.call(arguments);
+    fn = args[0];
+    vargs = args.slice(1, args.length - 1);
+    callback = args[args.length - 1];
+    return new FunctionCall(fn, vargs, callback);
+};
+
+},{"./lib/backoff":21,"./lib/function_call.js":22,"./lib/strategy/exponential":23,"./lib/strategy/fibonacci":24}],21:[function(require,module,exports){
+//      Copyright (c) 2012 Mathieu Turcotte
+//      Licensed under the MIT license.
+
+var events = require('events');
+var precond = require('precond');
+var util = require('util');
+
+// A class to hold the state of a backoff operation. Accepts a backoff strategy
+// to generate the backoff delays.
+function Backoff(backoffStrategy) {
+    events.EventEmitter.call(this);
+
+    this.backoffStrategy_ = backoffStrategy;
+    this.maxNumberOfRetry_ = -1;
+    this.backoffNumber_ = 0;
+    this.backoffDelay_ = 0;
+    this.timeoutID_ = -1;
+
+    this.handlers = {
+        backoff: this.onBackoff_.bind(this)
+    };
+}
+util.inherits(Backoff, events.EventEmitter);
+
+// Sets a limit, greater than 0, on the maximum number of backoffs. A 'fail'
+// event will be emitted when the limit is reached.
+Backoff.prototype.failAfter = function(maxNumberOfRetry) {
+    precond.checkArgument(maxNumberOfRetry > 0,
+        'Expected a maximum number of retry greater than 0 but got %s.',
+        maxNumberOfRetry);
+
+    this.maxNumberOfRetry_ = maxNumberOfRetry;
+};
+
+// Starts a backoff operation. Accepts an optional parameter to let the
+// listeners know why the backoff operation was started.
+Backoff.prototype.backoff = function(err) {
+    precond.checkState(this.timeoutID_ === -1, 'Backoff in progress.');
+
+    if (this.backoffNumber_ === this.maxNumberOfRetry_) {
+        this.emit('fail', err);
+        this.reset();
+    } else {
+        this.backoffDelay_ = this.backoffStrategy_.next();
+        this.timeoutID_ = setTimeout(this.handlers.backoff, this.backoffDelay_);
+        this.emit('backoff', this.backoffNumber_, this.backoffDelay_, err);
+    }
+};
+
+// Handles the backoff timeout completion.
+Backoff.prototype.onBackoff_ = function() {
+    this.timeoutID_ = -1;
+    this.emit('ready', this.backoffNumber_, this.backoffDelay_);
+    this.backoffNumber_++;
+};
+
+// Stops any backoff operation and resets the backoff delay to its inital value.
+Backoff.prototype.reset = function() {
+    this.backoffNumber_ = 0;
+    this.backoffStrategy_.reset();
+    clearTimeout(this.timeoutID_);
+    this.timeoutID_ = -1;
+};
+
+module.exports = Backoff;
+
+},{"events":168,"precond":27,"util":167}],22:[function(require,module,exports){
+//      Copyright (c) 2012 Mathieu Turcotte
+//      Licensed under the MIT license.
+
+var events = require('events');
+var precond = require('precond');
+var util = require('util');
+
+var Backoff = require('./backoff');
+var FibonacciBackoffStrategy = require('./strategy/fibonacci');
+
+// Wraps a function to be called in a backoff loop.
+function FunctionCall(fn, args, callback) {
+    events.EventEmitter.call(this);
+
+    precond.checkIsFunction(fn, 'Expected fn to be a function.');
+    precond.checkIsArray(args, 'Expected args to be an array.');
+    precond.checkIsFunction(callback, 'Expected callback to be a function.');
+
+    this.function_ = fn;
+    this.arguments_ = args;
+    this.callback_ = callback;
+    this.lastResult_ = [];
+    this.numRetries_ = 0;
+
+    this.backoff_ = null;
+    this.strategy_ = null;
+    this.failAfter_ = -1;
+    this.retryPredicate_ = FunctionCall.DEFAULT_RETRY_PREDICATE_;
+
+    this.state_ = FunctionCall.State_.PENDING;
+}
+util.inherits(FunctionCall, events.EventEmitter);
+
+// States in which the call can be.
+FunctionCall.State_ = {
+    // Call isn't started yet.
+    PENDING: 0,
+    // Call is in progress.
+    RUNNING: 1,
+    // Call completed successfully which means that either the wrapped function
+    // returned successfully or the maximal number of backoffs was reached.
+    COMPLETED: 2,
+    // The call was aborted.
+    ABORTED: 3
+};
+
+// The default retry predicate which considers any error as retriable.
+FunctionCall.DEFAULT_RETRY_PREDICATE_ = function(err) {
+  return true;
+};
+
+// Checks whether the call is pending.
+FunctionCall.prototype.isPending = function() {
+    return this.state_ == FunctionCall.State_.PENDING;
+};
+
+// Checks whether the call is in progress.
+FunctionCall.prototype.isRunning = function() {
+    return this.state_ == FunctionCall.State_.RUNNING;
+};
+
+// Checks whether the call is completed.
+FunctionCall.prototype.isCompleted = function() {
+    return this.state_ == FunctionCall.State_.COMPLETED;
+};
+
+// Checks whether the call is aborted.
+FunctionCall.prototype.isAborted = function() {
+    return this.state_ == FunctionCall.State_.ABORTED;
+};
+
+// Sets the backoff strategy to use. Can only be called before the call is
+// started otherwise an exception will be thrown.
+FunctionCall.prototype.setStrategy = function(strategy) {
+    precond.checkState(this.isPending(), 'FunctionCall in progress.');
+    this.strategy_ = strategy;
+    return this; // Return this for chaining.
+};
+
+// Sets the predicate which will be used to determine whether the errors
+// returned from the wrapped function should be retried or not, e.g. a
+// network error would be retriable while a type error would stop the
+// function call.
+FunctionCall.prototype.retryIf = function(retryPredicate) {
+    precond.checkState(this.isPending(), 'FunctionCall in progress.');
+    this.retryPredicate_ = retryPredicate;
+    return this;
+};
+
+// Returns all intermediary results returned by the wrapped function since
+// the initial call.
+FunctionCall.prototype.getLastResult = function() {
+    return this.lastResult_.concat();
+};
+
+// Returns the number of times the wrapped function call was retried.
+FunctionCall.prototype.getNumRetries = function() {
+    return this.numRetries_;
+};
+
+// Sets the backoff limit.
+FunctionCall.prototype.failAfter = function(maxNumberOfRetry) {
+    precond.checkState(this.isPending(), 'FunctionCall in progress.');
+    this.failAfter_ = maxNumberOfRetry;
+    return this; // Return this for chaining.
+};
+
+// Aborts the call.
+FunctionCall.prototype.abort = function() {
+    if (this.isCompleted() || this.isAborted()) {
+      return;
+    }
+
+    if (this.isRunning()) {
+        this.backoff_.reset();
+    }
+
+    this.state_ = FunctionCall.State_.ABORTED;
+    this.lastResult_ = [new Error('Backoff aborted.')];
+    this.emit('abort');
+    this.doCallback_();
+};
+
+// Initiates the call to the wrapped function. Accepts an optional factory
+// function used to create the backoff instance; used when testing.
+FunctionCall.prototype.start = function(backoffFactory) {
+    precond.checkState(!this.isAborted(), 'FunctionCall is aborted.');
+    precond.checkState(this.isPending(), 'FunctionCall already started.');
+
+    var strategy = this.strategy_ || new FibonacciBackoffStrategy();
+
+    this.backoff_ = backoffFactory ?
+        backoffFactory(strategy) :
+        new Backoff(strategy);
+
+    this.backoff_.on('ready', this.doCall_.bind(this, true /* isRetry */));
+    this.backoff_.on('fail', this.doCallback_.bind(this));
+    this.backoff_.on('backoff', this.handleBackoff_.bind(this));
+
+    if (this.failAfter_ > 0) {
+        this.backoff_.failAfter(this.failAfter_);
+    }
+
+    this.state_ = FunctionCall.State_.RUNNING;
+    this.doCall_(false /* isRetry */);
+};
+
+// Calls the wrapped function.
+FunctionCall.prototype.doCall_ = function(isRetry) {
+    if (isRetry) {
+        this.numRetries_++;
+    }
+    var eventArgs = ['call'].concat(this.arguments_);
+    events.EventEmitter.prototype.emit.apply(this, eventArgs);
+    var callback = this.handleFunctionCallback_.bind(this);
+    this.function_.apply(null, this.arguments_.concat(callback));
+};
+
+// Calls the wrapped function's callback with the last result returned by the
+// wrapped function.
+FunctionCall.prototype.doCallback_ = function() {
+    this.callback_.apply(null, this.lastResult_);
+};
+
+// Handles wrapped function's completion. This method acts as a replacement
+// for the original callback function.
+FunctionCall.prototype.handleFunctionCallback_ = function() {
+    if (this.isAborted()) {
+        return;
+    }
+
+    var args = Array.prototype.slice.call(arguments);
+    this.lastResult_ = args; // Save last callback arguments.
+    events.EventEmitter.prototype.emit.apply(this, ['callback'].concat(args));
+
+    var err = args[0];
+    if (err && this.retryPredicate_(err)) {
+        this.backoff_.backoff(err);
+    } else {
+        this.state_ = FunctionCall.State_.COMPLETED;
+        this.doCallback_();
+    }
+};
+
+// Handles the backoff event by reemitting it.
+FunctionCall.prototype.handleBackoff_ = function(number, delay, err) {
+    this.emit('backoff', number, delay, err);
+};
+
+module.exports = FunctionCall;
+
+},{"./backoff":21,"./strategy/fibonacci":24,"events":168,"precond":27,"util":167}],23:[function(require,module,exports){
+//      Copyright (c) 2012 Mathieu Turcotte
+//      Licensed under the MIT license.
+
+var util = require('util');
+var precond = require('precond');
+
+var BackoffStrategy = require('./strategy');
+
+// Exponential backoff strategy.
+function ExponentialBackoffStrategy(options) {
+    BackoffStrategy.call(this, options);
+    this.backoffDelay_ = 0;
+    this.nextBackoffDelay_ = this.getInitialDelay();
+    this.factor_ = ExponentialBackoffStrategy.DEFAULT_FACTOR;
+
+    if (options && options.factor !== undefined) {
+        precond.checkArgument(options.factor > 1,
+            'Exponential factor should be greater than 1 but got %s.',
+            options.factor);
+        this.factor_ = options.factor;
+    }
+}
+util.inherits(ExponentialBackoffStrategy, BackoffStrategy);
+
+// Default multiplication factor used to compute the next backoff delay from
+// the current one. The value can be overridden by passing a custom factor as
+// part of the options.
+ExponentialBackoffStrategy.DEFAULT_FACTOR = 2;
+
+ExponentialBackoffStrategy.prototype.next_ = function() {
+    this.backoffDelay_ = Math.min(this.nextBackoffDelay_, this.getMaxDelay());
+    this.nextBackoffDelay_ = this.backoffDelay_ * this.factor_;
+    return this.backoffDelay_;
+};
+
+ExponentialBackoffStrategy.prototype.reset_ = function() {
+    this.backoffDelay_ = 0;
+    this.nextBackoffDelay_ = this.getInitialDelay();
+};
+
+module.exports = ExponentialBackoffStrategy;
+
+},{"./strategy":25,"precond":27,"util":167}],24:[function(require,module,exports){
+//      Copyright (c) 2012 Mathieu Turcotte
+//      Licensed under the MIT license.
+
+var util = require('util');
+
+var BackoffStrategy = require('./strategy');
+
+// Fibonacci backoff strategy.
+function FibonacciBackoffStrategy(options) {
+    BackoffStrategy.call(this, options);
+    this.backoffDelay_ = 0;
+    this.nextBackoffDelay_ = this.getInitialDelay();
+}
+util.inherits(FibonacciBackoffStrategy, BackoffStrategy);
+
+FibonacciBackoffStrategy.prototype.next_ = function() {
+    var backoffDelay = Math.min(this.nextBackoffDelay_, this.getMaxDelay());
+    this.nextBackoffDelay_ += this.backoffDelay_;
+    this.backoffDelay_ = backoffDelay;
+    return backoffDelay;
+};
+
+FibonacciBackoffStrategy.prototype.reset_ = function() {
+    this.nextBackoffDelay_ = this.getInitialDelay();
+    this.backoffDelay_ = 0;
+};
+
+module.exports = FibonacciBackoffStrategy;
+
+},{"./strategy":25,"util":167}],25:[function(require,module,exports){
+//      Copyright (c) 2012 Mathieu Turcotte
+//      Licensed under the MIT license.
+
+var events = require('events');
+var util = require('util');
+
+function isDef(value) {
+    return value !== undefined && value !== null;
+}
+
+// Abstract class defining the skeleton for the backoff strategies. Accepts an
+// object holding the options for the backoff strategy:
+//
+//  * `randomisationFactor`: The randomisation factor which must be between 0
+//     and 1 where 1 equates to a randomization factor of 100% and 0 to no
+//     randomization.
+//  * `initialDelay`: The backoff initial delay in milliseconds.
+//  * `maxDelay`: The backoff maximal delay in milliseconds.
+function BackoffStrategy(options) {
+    options = options || {};
+
+    if (isDef(options.initialDelay) && options.initialDelay < 1) {
+        throw new Error('The initial timeout must be greater than 0.');
+    } else if (isDef(options.maxDelay) && options.maxDelay < 1) {
+        throw new Error('The maximal timeout must be greater than 0.');
+    }
+
+    this.initialDelay_ = options.initialDelay || 100;
+    this.maxDelay_ = options.maxDelay || 10000;
+
+    if (this.maxDelay_ <= this.initialDelay_) {
+        throw new Error('The maximal backoff delay must be ' +
+                        'greater than the initial backoff delay.');
+    }
+
+    if (isDef(options.randomisationFactor) &&
+        (options.randomisationFactor < 0 || options.randomisationFactor > 1)) {
+        throw new Error('The randomisation factor must be between 0 and 1.');
+    }
+
+    this.randomisationFactor_ = options.randomisationFactor || 0;
+}
+
+// Gets the maximal backoff delay.
+BackoffStrategy.prototype.getMaxDelay = function() {
+    return this.maxDelay_;
+};
+
+// Gets the initial backoff delay.
+BackoffStrategy.prototype.getInitialDelay = function() {
+    return this.initialDelay_;
+};
+
+// Template method that computes and returns the next backoff delay in
+// milliseconds.
+BackoffStrategy.prototype.next = function() {
+    var backoffDelay = this.next_();
+    var randomisationMultiple = 1 + Math.random() * this.randomisationFactor_;
+    var randomizedDelay = Math.round(backoffDelay * randomisationMultiple);
+    return randomizedDelay;
+};
+
+// Computes and returns the next backoff delay. Intended to be overridden by
+// subclasses.
+BackoffStrategy.prototype.next_ = function() {
+    throw new Error('BackoffStrategy.next_() unimplemented.');
+};
+
+// Template method that resets the backoff delay to its initial value.
+BackoffStrategy.prototype.reset = function() {
+    this.reset_();
+};
+
+// Resets the backoff delay to its initial value. Intended to be overridden by
+// subclasses.
+BackoffStrategy.prototype.reset_ = function() {
+    throw new Error('BackoffStrategy.reset_() unimplemented.');
+};
+
+module.exports = BackoffStrategy;
+
+},{"events":168,"util":167}],26:[function(require,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
@@ -3018,7 +3593,136 @@ if (typeof Object.create === 'function') {
   }
 }
 
-},{}],21:[function(require,module,exports){
+},{}],27:[function(require,module,exports){
+/*
+ * Copyright (c) 2012 Mathieu Turcotte
+ * Licensed under the MIT license.
+ */
+
+module.exports = require('./lib/checks');
+},{"./lib/checks":28}],28:[function(require,module,exports){
+/*
+ * Copyright (c) 2012 Mathieu Turcotte
+ * Licensed under the MIT license.
+ */
+
+var util = require('util');
+
+var errors = module.exports = require('./errors');
+
+function failCheck(ExceptionConstructor, callee, messageFormat, formatArgs) {
+    messageFormat = messageFormat || '';
+    var message = util.format.apply(this, [messageFormat].concat(formatArgs));
+    var error = new ExceptionConstructor(message);
+    Error.captureStackTrace(error, callee);
+    throw error;
+}
+
+function failArgumentCheck(callee, message, formatArgs) {
+    failCheck(errors.IllegalArgumentError, callee, message, formatArgs);
+}
+
+function failStateCheck(callee, message, formatArgs) {
+    failCheck(errors.IllegalStateError, callee, message, formatArgs);
+}
+
+module.exports.checkArgument = function(value, message) {
+    if (!value) {
+        failArgumentCheck(arguments.callee, message,
+            Array.prototype.slice.call(arguments, 2));
+    }
+};
+
+module.exports.checkState = function(value, message) {
+    if (!value) {
+        failStateCheck(arguments.callee, message,
+            Array.prototype.slice.call(arguments, 2));
+    }
+};
+
+module.exports.checkIsDef = function(value, message) {
+    if (value !== undefined) {
+        return value;
+    }
+
+    failArgumentCheck(arguments.callee, message ||
+        'Expected value to be defined but was undefined.',
+        Array.prototype.slice.call(arguments, 2));
+};
+
+module.exports.checkIsDefAndNotNull = function(value, message) {
+    // Note that undefined == null.
+    if (value != null) {
+        return value;
+    }
+
+    failArgumentCheck(arguments.callee, message ||
+        'Expected value to be defined and not null but got "' +
+        typeOf(value) + '".', Array.prototype.slice.call(arguments, 2));
+};
+
+// Fixed version of the typeOf operator which returns 'null' for null values
+// and 'array' for arrays.
+function typeOf(value) {
+    var s = typeof value;
+    if (s == 'object') {
+        if (!value) {
+            return 'null';
+        } else if (value instanceof Array) {
+            return 'array';
+        }
+    }
+    return s;
+}
+
+function typeCheck(expect) {
+    return function(value, message) {
+        var type = typeOf(value);
+
+        if (type == expect) {
+            return value;
+        }
+
+        failArgumentCheck(arguments.callee, message ||
+            'Expected "' + expect + '" but got "' + type + '".',
+            Array.prototype.slice.call(arguments, 2));
+    };
+}
+
+module.exports.checkIsString = typeCheck('string');
+module.exports.checkIsArray = typeCheck('array');
+module.exports.checkIsNumber = typeCheck('number');
+module.exports.checkIsBoolean = typeCheck('boolean');
+module.exports.checkIsFunction = typeCheck('function');
+module.exports.checkIsObject = typeCheck('object');
+
+},{"./errors":29,"util":167}],29:[function(require,module,exports){
+/*
+ * Copyright (c) 2012 Mathieu Turcotte
+ * Licensed under the MIT license.
+ */
+
+var util = require('util');
+
+function IllegalArgumentError(message) {
+    Error.call(this, message);
+    this.message = message;
+}
+util.inherits(IllegalArgumentError, Error);
+
+IllegalArgumentError.prototype.name = 'IllegalArgumentError';
+
+function IllegalStateError(message) {
+    Error.call(this, message);
+    this.message = message;
+}
+util.inherits(IllegalStateError, Error);
+
+IllegalStateError.prototype.name = 'IllegalStateError';
+
+module.exports.IllegalStateError = IllegalStateError;
+module.exports.IllegalArgumentError = IllegalArgumentError;
+},{"util":167}],30:[function(require,module,exports){
 // shim for using process in browser
 var process = module.exports = {};
 
@@ -3204,7 +3908,7 @@ process.chdir = function (dir) {
 };
 process.umask = function() { return 0; };
 
-},{}],22:[function(require,module,exports){
+},{}],31:[function(require,module,exports){
 'use strict';
 
 var CancelablePromise = require('./util/cancelablepromise');
@@ -3253,38 +3957,71 @@ function createCancelableRoomPromise(getLocalTracks, createLocalParticipant, cre
 }
 
 module.exports = createCancelableRoomPromise;
-},{"./util/cancelablepromise":129}],23:[function(require,module,exports){
+},{"./util/cancelablepromise":141}],32:[function(require,module,exports){
 'use strict';
 
 var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
 
-var _require = require('@twilio/webrtc/lib/util'),
-    guessBrowser = _require.guessBrowser;
+var _require = require('@twilio/webrtc'),
+    MediaStreamTrack = _require.MediaStreamTrack;
 
-var CancelablePromise = require('./util/cancelablepromise');
+var _require2 = require('@twilio/webrtc/lib/util'),
+    guessBrowser = _require2.guessBrowser,
+    guessBrowserVersion = _require2.guessBrowserVersion;
+
 var createCancelableRoomPromise = require('./cancelableroompromise');
 var createLocalTracks = require('./createlocaltracks');
-var ConstantIceServerSource = require('./iceserversource/constant');
-var constants = require('./util/constants');
-var Room = require('./room');
-var E = require('./util/constants').typeErrors;
 var EncodingParametersImpl = require('./encodingparameters');
-var LocalAudioTrack = require('./media/track/es5/localaudiotrack');
-var LocalDataTrack = require('./media/track/es5/localdatatrack');
-var LocalParticipant = require('./localparticipant');
-var LocalVideoTrack = require('./media/track/es5/localvideotrack');
-var Log = require('./util/log');
-var MediaStreamTrack = require('@twilio/webrtc').MediaStreamTrack;
+var ConstantIceServerSource = require('./iceserversource/constant');
 var NTSIceServerSource = require('./iceserversource/nts');
-var SignalingV2 = require('./signaling/v2');
-var util = require('./util');
+var LocalParticipant = require('./localparticipant');
+
+var _require3 = require('./media/track/es5'),
+    LocalAudioTrack = _require3.LocalAudioTrack,
+    LocalDataTrack = _require3.LocalDataTrack,
+    LocalVideoTrack = _require3.LocalVideoTrack;
+
 var NetworkQualityConfigurationImpl = require('./networkqualityconfiguration');
+var Room = require('./room');
+var SignalingV2 = require('./signaling/v2');
+
+var _require4 = require('./util'),
+    asLocalTrack = _require4.asLocalTrack,
+    buildLogLevels = _require4.buildLogLevels,
+    filterObject = _require4.filterObject,
+    isNonArrayObject = _require4.isNonArrayObject;
+
+var _require5 = require('./util/constants'),
+    DEFAULT_ENVIRONMENT = _require5.DEFAULT_ENVIRONMENT,
+    DEFAULT_LOG_LEVEL = _require5.DEFAULT_LOG_LEVEL,
+    DEFAULT_REALM = _require5.DEFAULT_REALM,
+    DEFAULT_REGION = _require5.DEFAULT_REGION,
+    ICE_SERVERS_TIMEOUT_MS = _require5.ICE_SERVERS_TIMEOUT_MS,
+    WS_SERVER = _require5.WS_SERVER,
+    E = _require5.typeErrors;
+
+var CancelablePromise = require('./util/cancelablepromise');
+var Log = require('./util/log');
+
+var _require6 = require('./util/validate'),
+    validateBandwidthProfile = _require6.validateBandwidthProfile;
+
+var safariVersion = guessBrowser() === 'safari' && guessBrowserVersion();
 
 // This is used to make out which connect() call a particular Log statement
 // belongs to. Each call to connect() increments this counter.
 var connectCalls = 0;
 
 var didPrintSafariWarning = false;
+var didPrintDscpTaggingWarning = false;
+var isSafariWithoutVP8Support = false;
+
+if (safariVersion) {
+  var safariMajorVersion = safariVersion.major,
+      safariMinorVersion = safariVersion.minor;
+
+  isSafariWithoutVP8Support = safariMajorVersion < 12 || safariMajorVersion === 12 && safariMinorVersion < 1;
+}
 
 /**
  * Connect to a {@link Room}.
@@ -3299,6 +4036,7 @@ var didPrintSafariWarning = false;
  *   {@link LocalAudioTrack} and {@link LocalVideoTrack} automatically, you can
  *   pass your own array which you can stop yourself. See {@link ConnectOptions}
  *   for more information.
+ * @alias module:twilio-video.connect
  * @param {string} token - The Access Token string
  * @param {ConnectOptions} [options] - Options to override the default behavior
  * @returns {CancelablePromise<Room>}
@@ -3318,6 +4056,8 @@ var didPrintSafariWarning = false;
  *   room.once('disconnected', function() {
  *     console.log('You left the Room:', room.name);
  *   });
+ * }).catch(error => {
+ *   console.log('Could not connect to the Room:', error.message);
  * });
  * @example
  * var Video = require('twilio-video');
@@ -3335,6 +4075,8 @@ var didPrintSafariWarning = false;
  *   room.once('disconnected', function() {
  *     console.log('You left the Room:', room.name);
  *   });
+ * }).catch(error => {
+ *   console.log('Could not connect to the Room:', error.message);
  * });
  * @example
  * var Video = require('twilio-video');
@@ -3357,6 +4099,8 @@ var didPrintSafariWarning = false;
  *   room.once('disconnected', function() {
  *     console.log('You left the Room:', room.name);
  *   });
+ * }).catch(error => {
+ *   console.log('Could not connect to the Room:', error.message);
  * });
  * @example
  * var Video = require('twilio-video');
@@ -3371,14 +4115,25 @@ var didPrintSafariWarning = false;
  *   room.localParticipants.trackPublications.forEach(function(publication) {
  *     console.log('The LocalTrack "' + publication.trackName + '" was successfully published');
  *   });
+ * }).catch(error => {
+ *   console.log('Could not connect to the Room:', error.message);
  * });
  */
 function connect(token, options) {
   if (typeof options === 'undefined') {
     options = {};
   }
-  if ((typeof options === 'undefined' ? 'undefined' : _typeof(options)) !== 'object' || Array.isArray(options)) {
+  if (!isNonArrayObject(options)) {
     return CancelablePromise.reject(E.INVALID_TYPE('options', 'object'));
+  }
+
+  var shouldPrintDscpTaggingWarning = false;
+  if ('dscpTagging' in options) {
+    options = Object.assign({
+      enableDscp: options.dscpTagging
+    }, options);
+    delete options.dscpTagging;
+    shouldPrintDscpTaggingWarning = !didPrintDscpTaggingWarning;
   }
 
   options = Object.assign({
@@ -3386,49 +4141,57 @@ function connect(token, options) {
     automaticSubscription: true,
     createLocalTracks: createLocalTracks,
     dominantSpeaker: false,
-    environment: constants.DEFAULT_ENVIRONMENT,
-    iceServersTimeout: constants.ICE_SERVERS_TIMEOUT_MS,
+    enableDscp: false,
+    environment: DEFAULT_ENVIRONMENT,
+    iceServersTimeout: ICE_SERVERS_TIMEOUT_MS,
     insights: true,
     LocalAudioTrack: LocalAudioTrack,
     LocalDataTrack: LocalDataTrack,
     LocalParticipant: LocalParticipant,
     LocalVideoTrack: LocalVideoTrack,
+    Log: Log,
     MediaStreamTrack: MediaStreamTrack,
-    logLevel: constants.DEFAULT_LOG_LEVEL,
+    logLevel: DEFAULT_LOG_LEVEL,
     maxAudioBitrate: null,
     maxVideoBitrate: null,
     name: null,
     networkQuality: false,
     preferredAudioCodecs: [],
     preferredVideoCodecs: [],
-    realm: constants.DEFAULT_REALM,
-    region: constants.DEFAULT_REGION,
-    // TODO(mmalavalli): Remove once we decide to support Unified Plan on Chrome 72+
-    sdpSemantics: constants.DEFAULT_CHROME_SDP_SEMANTICS,
+    realm: DEFAULT_REALM,
+    region: DEFAULT_REGION,
     signaling: SignalingV2
-  }, util.filterObject(options));
+  }, filterObject(options));
 
   /* eslint new-cap:0 */
-  var wsServer = constants.WS_SERVER(options.environment, options.region);
+  var wsServer = WS_SERVER(options.environment, options.region);
 
   options = Object.assign({ wsServer: wsServer }, options);
 
-  var logLevels = util.buildLogLevels(options.logLevel);
+  var logLevels = buildLogLevels(options.logLevel);
   var logComponentName = '[connect #' + ++connectCalls + ']';
 
   var log = void 0;
   try {
-    log = new Log('default', logComponentName, logLevels);
+    log = new options.Log('default', logComponentName, logLevels);
   } catch (error) {
     return CancelablePromise.reject(error);
   }
   options.log = log;
 
+  // NOTE(mmalavalli): Print the "dscpTagging" deprecation warning once if the log-level
+  // is at least "warn", i.e. neither "error" nor "off".
+  if (shouldPrintDscpTaggingWarning && log.level !== 'error' && log.level !== 'off') {
+    didPrintDscpTaggingWarning = true;
+    log.warn(['The ConnectOptions flag "dscpTagging" is deprecated and scheduled for removal.', 'Please use "enableDscp" instead.'].join(' '));
+  }
+
   // NOTE(mroberts): Print the Safari warning once if the log-level is at least
   // "warn", i.e. neither "error" nor "off".
-  if (guessBrowser() === 'safari' && !didPrintSafariWarning && log.logLevel !== 'error' && log.logLevel !== 'off') {
+  // NOTE(mmalavalli): Print the Safari warning only for versions 12.0 and below.
+  if (isSafariWithoutVP8Support && !didPrintSafariWarning && log.logLevel !== 'error' && log.logLevel !== 'off') {
     didPrintSafariWarning = true;
-    log.warn(['This release of twilio-video.js includes experimental support for', 'Safari 11 and newer. Support for Safari is "experimental" because,', 'at the time of writing, Safari does not support VP8. This means you', 'may experience codec issues in Group Rooms. You may also experience', 'codec issues in Peer-to-Peer (P2P) Rooms containing Android- or', 'iOS-based Participants who do not support H.264. However, P2P Rooms', 'with browser-based Participants should work. Please test this release', 'and report any issues to https://github.com/twilio/twilio-video.js'].join(' '));
+    log.warn(['Support for Safari 12.0 and below is limited because it does not support VP8.', 'This means you may experience codec issues in Group Rooms. You may also', 'experience codec issues in Peer-to-Peer (P2P) Rooms containing Android- or', 'iOS-based Participants who do not support H.264. However, P2P Rooms', 'with browser-based Participants should work. For more information, please', 'refer to this guide: https://www.twilio.com/docs/video/javascript-v2-developing-safari-11'].join(' '));
   }
 
   if (typeof token !== 'string') {
@@ -3447,11 +4210,16 @@ function connect(token, options) {
     }
     try {
       options.tracks = options.tracks.map(function (track) {
-        return util.asLocalTrack(track, localTrackOptions);
+        return asLocalTrack(track, localTrackOptions);
       });
     } catch (error) {
       return CancelablePromise.reject(error);
     }
+  }
+
+  var error = validateBandwidthProfile(options.bandwidthProfile);
+  if (error) {
+    return CancelablePromise.reject(error);
   }
 
   var Signaling = options.signaling;
@@ -3477,10 +4245,10 @@ function connect(token, options) {
     video: options.preferredVideoCodecs.map(normalizeVideoCodecSettings)
   };
 
-  var networkQualityConfiguration = new NetworkQualityConfigurationImpl(_typeof(options.networkQuality) === 'object' ? options.networkQuality : {});
+  var networkQualityConfiguration = new NetworkQualityConfigurationImpl(isNonArrayObject(options.networkQuality) ? options.networkQuality : {});
 
   // Convert options.networkQuality to boolean to configure Media Signaling
-  options.networkQuality = _typeof(options.networkQuality) === 'object' || options.networkQuality;
+  options.networkQuality = isNonArrayObject(options.networkQuality) || options.networkQuality;
 
   // Create a CancelableRoomPromise<Room> that resolves after these steps:
   // 1 - Get the LocalTracks.
@@ -3527,8 +4295,26 @@ function connect(token, options) {
  *   not subscribe to any RemoteTrack in a Group or Small Group Room. Setting it to
  *   <code>true</code>, or not setting it at all preserves the default behavior. This
  *   flag does not have any effect in a Peer-to-Peer Room.
+ * @property {BandwidthProfileOptions} [bandwidthProfile] - You can optionally configure
+ *   how your available downlink bandwidth is shared among the RemoteTracks you have subscribed
+ *   to in a Group Room. By default, bandwidth is shared equally among the RemoteTracks.
+ *   This has no effect in Peer-to-Peer Rooms.
  * @property {boolean} [dominantSpeaker=false] - Whether to enable the Dominant
  *   Speaker API or not. This only takes effect in Group Rooms.
+ * @property {boolean} [dscpTagging=false] - <code>(deprecated: use "enableDscp" instead)</code>
+ *   DSCP tagging allows you to request enhanced QoS treatment for RTP media packets from any
+ *   firewall that the client may be behind. Setting this option to <code>true</code> will
+ *   request DSCP tagging for media packets on supported browsers (only Chrome supports this
+ *   as of now). Audio packets will be sent with DSCP header value set to 0xb8 which corresponds
+ *   to Expedited Forwarding (EF). Video packets will be sent with DSCP header value set to 0x88
+ *   which corresponds to Assured Forwarding (AF41).
+ * @property {boolean} [enableDscp=false] - DSCP tagging allows you to request enhanced
+ *   QoS treatment for RTP media packets from any firewall that the client may be behind.
+ *   Setting this option to <code>true</code> will request DSCP tagging for media packets
+ *   on supported browsers (only Chrome supports this as of now). Audio packets will be
+ *   sent with DSCP header value set to 0xb8 which corresponds to Expedited Forwarding (EF).
+ *   Video packets will be sent with DSCP header value set to 0x88 which corresponds to
+ *   Assured Forwarding (AF41).
  * @property {Array<RTCIceServer>} iceServers - Override the STUN and TURN
  *   servers used when connecting to {@link Room}s
  * @property {number} [iceServersTimeout=3000] - Override the amount of time, in
@@ -3538,13 +4324,17 @@ function connect(token, options) {
  * @property {boolean} [insights=true] - Whether publishing events
  *   to the Insights gateway is enabled or not
  * @property {?number} [maxAudioBitrate=null] - Max outgoing audio bitrate (bps);
- *   A <code>null</code> value does not set any bitrate limit; This value is set
- *   as a hint for variable bitrate codecs, but will not take effect for fixed
- *   bitrate codecs
+ *   A <code>null</code> or a <code>0</code> value does not set any bitrate limit;
+ *   This value is set as a hint for variable bitrate codecs, but will not take
+ *   effect for fixed bitrate codecs; Based on our tests, Chrome, Firefox and Safari
+ *   support a bitrate range of 12000 bps to 256000 bps for Opus codec; This parameter
+ *   has no effect on iSAC, PCMU and PCMA codecs
  * @property {?number} [maxVideoBitrate=null] - Max outgoing video bitrate (bps);
- *   A <code>null</code> value does not set any bitrate limit; This value is set
- *   as a hint for variable bitrate codecs, but will not take effect for fixed
- *   bitrate codecs
+ *   A <code>null</code> or <code>0</code> value does not set any bitrate limit;
+ *   This value is set as a hint for variable bitrate codecs, but will not take
+ *   effect for fixed bitrate codecs; Based on our tests, Chrome, Firefox and Safari
+ *   all seem to support an average bitrate range of 20000 bps (20 kbps) to
+ *   8000000 bps (8 mbps) for a 720p VideoTrack
  * @property {?string} [name=null] - Set to connect to a {@link Room} by name
  * @property {boolean|NetworkQualityConfiguration} [networkQuality=false] - Whether to enable the Network
  *   Quality API or not. This only takes effect in Group Rooms. Pass a {@link NetworkQualityConfiguration}
@@ -3582,6 +4372,60 @@ function connect(token, options) {
  */
 
 /**
+ * {@link BandwidthProfileOptions} allows you to configure how your available downlink
+ * bandwidth is shared among the RemoteTracks you have subscribed to in a Group Room.
+ * @typedef {object} BandwidthProfileOptions
+ * @property {VideoBandwidthProfileOptions} [video] - Optional parameter to configure
+ *   how your available downlink bandwidth is shared among the {@link RemoteVideoTrack}s you
+ *   have subscribed to in a Group Room.
+ */
+
+/**
+ * {@link VideoBandwidthProfileOptions} allows you to configure how your available downlink
+ * bandwidth is shared among the {@link RemoteVideoTrack}s you have subscribed to in a Group Room.
+ * @typedef {object} VideoBandwidthProfileOptions
+ * @property {Track.Priority} [dominantSpeakerPriority="standard"] - Optional parameter to
+ *   specify the minimum subscribe {@link Track.Priority} of the Dominant Speaker's {@link RemoteVideoTrack}s.
+ *   This means that the Dominant Speaker's {@link RemoteVideoTrack}s that are published with
+ *   lower {@link Track.Priority} will be subscribed to with the {@link Track.Priority} specified here.
+ *   This has no effect on {@link RemoteVideoTrack}s published with higher {@link Track.Priority}, which will
+ *   still be subscribed to with with the same {@link Track.Priority}. If not specified, this defaults to "standard".
+ *   This parameter only applies to a Group Room Participant when {@link ConnectOptions}.dominantSpeaker is set to true.
+ * @property {number} [maxSubscriptionBitrate] - Optional parameter to specify the maximum
+ *   downlink video bandwidth in bits per second (bps). By default, there are no limits on
+ *   the downlink video bandwidth.
+ * @property {number} [maxTracks] - Optional parameter to specify the maximum number of visible
+ *   {@link RemoteVideoTrack}s, which will be selected based on {@link Track.Priority} and an N-Loudest
+ *   policy. By default there are no limits on the number of visible {@link RemoteVideoTrack}s.
+ *   0 or a negative value will remove any limit on the maximum number of visible {@link RemoteVideoTrack}s.
+ * @property {BandwidthProfileMode} [mode="grid"] - Optional parameter to specify how the {@link RemoteVideoTrack}s'
+ *   TrackPriority values are mapped to bandwidth allocation in Group Rooms. This defaults to "grid",
+ *   which results in equal bandwidth share allocation to all {@link RemoteVideoTrack}s.
+ * @property {VideoRenderDimensions} [renderDimensions] - Optional parameter to specify the desired
+ *   render dimensions of {@link RemoteVideoTrack}s based on {@link Track.Priority} and the
+ *   {@link RemoteVideoTrack}s of the Dominant Speaker.
+ * @property {TrackSwitchOffMode} [trackSwitchOffMode="predicted"] - Optional parameter to configure
+ *   how {@link RemoteVideoTrack}s are switched off in response to bandwidth pressure. Defaults to "predicted".
+ */
+
+/**
+ * {@link VideoRenderDimensions} allows you to specify the desired render dimensions of {@link RemoteVideoTrack}s
+ * based on {@link Track.Priority}. The bandwidth allocation algorithm will distribute the available downlink bandwidth
+ * proportional to the requested render dimensions. This is just an input for calculating the bandwidth to be allocated
+ * and does not affect the actual resolution of the {@link RemoteVideoTrack}s.
+ * @typedef {object} VideoRenderDimensions
+ * @property {VideoTrack.Dimensions} [high] - Optional parameter to specify the desired rendering dimensions of
+ *   {@link RemoteVideoTrack} whose {@link Track.Priority} is "high". 0 or a negative value will result in the lowest
+ *   possible resolution. This defaults to 1280 x 720 (HD).
+ * @property {VideoTrack.Dimensions} [low] - Optional parameter to specify the desired rendering dimensions of
+ *   {@link RemoteVideoTrack} whose {@link Track.Priority} is "low". 0 or a negative value will result in the lowest
+ *   possible resolution. This defaults to 176 x 144 (QCIF).
+ * @property {VideoTrack.Dimensions} [standard] - Optional parameter to specify the desired rendering dimensions of
+ *   {@link RemoteVideoTrack} whose {@link Track.Priority} is "standard". 0 or a negative value will result in the lowest
+ *   possible resolution. This defaults to 640 x 480 (VGA).
+ */
+
+/**
  * Configure verbosity levels for network quality information for
  * {@link LocalParticipant} and {@link RemoteParticipant}s.
  * @typedef {object} NetworkQualityConfiguration
@@ -3591,7 +4435,7 @@ function connect(token, options) {
 
 /**
  * You may pass these levels to {@link ConnectOptions} to override
- *   log levels for individual components.
+ * log levels for individual components.
  * @typedef {object} LogLevels
  * @property {LogLevel} [default='warn'] - Log level for 'default' modules.
  * @property {LogLevel} [media='warn'] - Log level for 'media' modules.
@@ -3681,6 +4525,67 @@ var NetworkQualityVerbosity = {
   detailed: 3
 };
 
+/**
+ * {@link TrackSwitchOffMode} specifies when {@link RemoteVideoTrack}s' are switched off.
+ * @enum {string}
+ */
+// eslint-disable-next-line
+var TrackSwitchOffMode = {
+  /**
+   * In this mode, {@link RemoteVideoTrack}s are switched off only when network congestion
+   * is detected.
+   */
+  detected: 'detected',
+
+  /**
+   * In this mode, {@link RemoteVideoTrack}s are pro-actively switched off when network
+   * congestion is predicted by the bandwidth estimation mechanism.
+   */
+  predicted: 'predicted',
+
+  /**
+   * In this mode, {@link RemoteVideoTrack}s are not switched off. Instead in response to network
+   * congestion, tracks will be adjusted to lower quality.
+   */
+  disabled: 'disabled'
+};
+
+/**
+ * {@link BandwidthProfileMode} specifies how {@link RemoteVideoTrack}s' {@link Track.Priority} values
+ * are mapped to bandwidth allocation in Group Rooms.
+ * @enum {string}
+ */
+// eslint-disable-next-line
+var BandwidthProfileMode = {
+  /**
+   * This mode is for use cases where all the subscribed {@link RemoteVideoTrack}s are
+   * equally important. The bandwidth allocation algorithm will share the available
+   * downlink bandwidth equally among the subscribed {@link RemoteVideoTrack}s, irrespective
+   * of their {@link Track.Priority}. In case of insufficient downlink bandwidth, the lower
+   * priority {@link RemoteVideoTrack}s are switched off.
+   */
+  grid: 'grid',
+  /**
+   * This mode is for use cases where some {@link RemoteVideoTrack}s are prioritized more than
+   * others. However, the lower priority {@link RemoteVideoTrack}s still need to be visible.
+   * The bandwidth allocation algorithm will share the available downlink bandwidth proportional
+   * to the requested {@link VideoRenderDimensions} corresponding to their {@link Track.Priority}.
+   * In case of insufficient downlink bandwidth, the quality of higher priority {@link RemoteVideoTrack}s
+   * may be degraded to avoid switching off lower priority {@link RemoteVideoTrack}s.
+   */
+  collaboration: 'collaboration',
+  /**
+   * This mode is for use cases where some {@link RemoteVideoTrack}s are deemed critical and must
+   * be preserved at any cost over the other {@link RemoteVideoTrack}s. The bandwidth allocation
+   * algorithm will allocate as big a share of the available downlink bandwidth as it possibly
+   * can to the higher priority {@link RemoteVideoTrack}s, and only then consider the lower priority
+   * {@link RemoteVideoTrack}s. In case of insufficient downlink bandwidth, the lower priority
+   * {@link RemoteVideoTrack}s are switched off in order to preserve the quality of the higher
+   * priority {@link RemoteVideoTrack}s.
+   */
+  presentation: 'presentation'
+};
+
 function createLocalParticipant(signaling, log, encodingParameters, networkQualityConfiguration, options, localTracks) {
   var localParticipantSignaling = signaling.createLocalParticipantSignaling(encodingParameters, networkQualityConfiguration);
   log.debug('Creating a new LocalParticipant:', localParticipantSignaling);
@@ -3765,7 +4670,7 @@ function normalizeVideoCodecSettings(nameOrSettings) {
 }
 
 module.exports = connect;
-},{"./cancelableroompromise":22,"./createlocaltracks":25,"./encodingparameters":31,"./iceserversource/constant":33,"./iceserversource/nts":34,"./localparticipant":36,"./media/track/es5/localaudiotrack":38,"./media/track/es5/localdatatrack":39,"./media/track/es5/localvideotrack":40,"./networkqualityconfiguration":64,"./room":69,"./signaling/v2":83,"./util":132,"./util/cancelablepromise":129,"./util/constants":130,"./util/log":135,"@twilio/webrtc":3,"@twilio/webrtc/lib/util":16}],24:[function(require,module,exports){
+},{"./cancelableroompromise":31,"./createlocaltracks":34,"./encodingparameters":40,"./iceserversource/constant":42,"./iceserversource/nts":43,"./localparticipant":45,"./media/track/es5":47,"./networkqualityconfiguration":74,"./room":79,"./signaling/v2":93,"./util":144,"./util/cancelablepromise":141,"./util/constants":142,"./util/log":147,"./util/validate":159,"@twilio/webrtc":3,"@twilio/webrtc/lib/util":16}],33:[function(require,module,exports){
 'use strict';
 
 var defaultCreateLocalTracks = require('./createlocaltracks');
@@ -3799,6 +4704,7 @@ function createLocalTrack(kind, options) {
 
 /**
  * Request a {@link LocalAudioTrack}.
+ * @alias module:twilio-video.createLocalAudioTrack
  * @param {CreateLocalTrackOptions} [options] - Options for requesting a {@link LocalAudioTrack}
  * @returns {Promise<LocalAudioTrack>}
  * @example
@@ -3828,6 +4734,7 @@ function createLocalAudioTrack(options) {
 
 /**
  * Request a {@link LocalVideoTrack}.
+ * @alias module:twilio-video.createLocalVideoTrack
  * @param {CreateLocalTrackOptions} [options] - Options for requesting a {@link LocalVideoTrack}
  * @returns {Promise<LocalVideoTrack>}
  * @example
@@ -3856,7 +4763,9 @@ function createLocalVideoTrack(options) {
 }
 
 /**
- * Create {@link LocalTrack} options.
+ * Create {@link LocalTrack} options. Apart from the properties listed here, you can
+ * also specify any of the <a href="https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackConstraints" target="_blank">MediaTrackConstraints</a>
+ * properties.
  * @typedef {MediaTrackConstraints} CreateLocalTrackOptions
  * @property {LogLevel|LogLevels} logLevel
  * @property {string} [name] - The {@link LocalTrack}'s name; by default,
@@ -3871,15 +4780,18 @@ module.exports = {
   audio: createLocalAudioTrack,
   video: createLocalVideoTrack
 };
-},{"./createlocaltracks":25,"./util/constants":130}],25:[function(require,module,exports){
+},{"./createlocaltracks":34,"./util/constants":142}],34:[function(require,module,exports){
 'use strict';
 
 var asLocalTrack = require('./util').asLocalTrack;
 var buildLogLevels = require('./util').buildLogLevels;
 var getUserMedia = require('@twilio/webrtc').getUserMedia;
-var LocalAudioTrack = require('./media/track/es5/localaudiotrack');
-var LocalDataTrack = require('./media/track/es5/localdatatrack');
-var LocalVideoTrack = require('./media/track/es5/localvideotrack');
+
+var _require = require('./media/track/es5'),
+    LocalAudioTrack = _require.LocalAudioTrack,
+    LocalDataTrack = _require.LocalDataTrack,
+    LocalVideoTrack = _require.LocalVideoTrack;
+
 var MediaStreamTrack = require('@twilio/webrtc').MediaStreamTrack;
 var Log = require('./util/log');
 var DEFAULT_LOG_LEVEL = require('./util/constants').DEFAULT_LOG_LEVEL;
@@ -3893,6 +4805,7 @@ var createLocalTrackCalls = 0;
 /**
  * Request {@link LocalTrack}s. By default, it requests a
  * {@link LocalAudioTrack} and a {@link LocalVideoTrack}.
+ * @alias module:twilio-video.createLocalTracks
  * @param {CreateLocalTracksOptions} [options]
  * @returns {Promise<Array<LocalTrack>>}
  * @example
@@ -4012,7 +4925,7 @@ function createLocalTracks(options) {
  */
 
 module.exports = createLocalTracks;
-},{"./media/track/es5/localaudiotrack":38,"./media/track/es5/localdatatrack":39,"./media/track/es5/localvideotrack":40,"./util":132,"./util/constants":130,"./util/log":135,"./webaudio/workaround180748":149,"@twilio/webrtc":3}],26:[function(require,module,exports){
+},{"./media/track/es5":47,"./util":144,"./util/constants":142,"./util/log":147,"./webaudio/workaround180748":162,"@twilio/webrtc":3}],35:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -4102,7 +5015,7 @@ var DataTrackReceiver = function (_DataTrackTransceiver) {
  */
 
 module.exports = DataTrackReceiver;
-},{"./transceiver":28,"./transport":29}],27:[function(require,module,exports){
+},{"./transceiver":37,"./transport":38}],36:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -4264,7 +5177,7 @@ var DataTrackSender = function (_DataTrackTransceiver) {
 }(DataTrackTransceiver);
 
 module.exports = DataTrackSender;
-},{"../util":132,"./transceiver":28}],28:[function(require,module,exports){
+},{"../util":144,"./transceiver":37}],37:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -4323,7 +5236,7 @@ var DataTrackTransceiver = function (_TrackTransceiver) {
 }(TrackTransceiver);
 
 module.exports = DataTrackTransceiver;
-},{"../transceiver":126}],29:[function(require,module,exports){
+},{"../transceiver":138}],38:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -4438,7 +5351,7 @@ var DataTransport = function (_EventEmitter) {
  */
 
 module.exports = DataTransport;
-},{"events":155}],30:[function(require,module,exports){
+},{"events":168}],39:[function(require,module,exports){
 'use strict';
 
 var request = require('./request');
@@ -4507,7 +5420,7 @@ function toQueryString(params) {
 }
 
 module.exports.getConfiguration = getConfiguration;
-},{"./request":68,"./util/twilio-video-errors":145}],31:[function(require,module,exports){
+},{"./request":78,"./util/twilio-video-errors":157}],40:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -4614,7 +5527,7 @@ var EncodingParametersImpl = function (_EventEmitter) {
  */
 
 module.exports = EncodingParametersImpl;
-},{"events":155}],32:[function(require,module,exports){
+},{"events":168}],41:[function(require,module,exports){
 'use strict';
 
 var _require = require('events'),
@@ -4624,7 +5537,7 @@ var _require2 = require('./util'),
     hidePrivateAndCertainPublicPropertiesInClass = _require2.hidePrivateAndCertainPublicPropertiesInClass;
 
 module.exports = hidePrivateAndCertainPublicPropertiesInClass(EventEmitter, ['domain']);
-},{"./util":132,"events":155}],33:[function(require,module,exports){
+},{"./util":144,"events":168}],42:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -4707,7 +5620,7 @@ var ConstantIceServerSource = function (_EventEmitter) {
 }(EventEmitter);
 
 module.exports = ConstantIceServerSource;
-},{"events":155}],34:[function(require,module,exports){
+},{"events":168}],43:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -4990,8 +5903,20 @@ function poll(client) {
 }
 
 module.exports = NTSIceServerSource;
-},{"../../package.json":150,"../ecs":30,"../util":132,"../util/constants":130,"../util/log":135,"../util/timeoutpromise":144,"../util/twilio-video-errors":145,"events":155}],35:[function(require,module,exports){
+},{"../../package.json":163,"../ecs":39,"../util":144,"../util/constants":142,"../util/log":147,"../util/timeoutpromise":156,"../util/twilio-video-errors":157,"events":168}],44:[function(require,module,exports){
 'use strict';
+
+var _require = require('./media/track/es5'),
+    LocalAudioTrack = _require.LocalAudioTrack,
+    LocalDataTrack = _require.LocalDataTrack,
+    LocalVideoTrack = _require.LocalVideoTrack;
+
+/**
+ * @module twilio-video
+ * @property {boolean} isSupported - true if the current browser is officially supported by twilio-video.js.
+ * @property {string} version - current version of twilio-video.js.
+ */
+
 
 var version = require('../package.json').version;
 var Video = {};
@@ -5019,15 +5944,15 @@ Object.defineProperties(Video, {
   },
   LocalAudioTrack: {
     enumerable: true,
-    value: require('./media/track/es5/localaudiotrack')
+    value: LocalAudioTrack
   },
   LocalDataTrack: {
     enumerable: true,
-    value: require('./media/track/es5/localdatatrack')
+    value: LocalDataTrack
   },
   LocalVideoTrack: {
     enumerable: true,
-    value: require('./media/track/es5/localvideotrack')
+    value: LocalVideoTrack
   },
   version: {
     enumerable: true,
@@ -5036,7 +5961,7 @@ Object.defineProperties(Video, {
 });
 
 module.exports = Video;
-},{"../package.json":150,"./connect":23,"./createlocaltrack":24,"./createlocaltracks":25,"./media/track/es5/localaudiotrack":38,"./media/track/es5/localdatatrack":39,"./media/track/es5/localvideotrack":40,"./util/support":142}],36:[function(require,module,exports){
+},{"../package.json":163,"./connect":32,"./createlocaltrack":33,"./createlocaltracks":34,"./media/track/es5":47,"./util/support":154}],45:[function(require,module,exports){
 'use strict';
 
 var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
@@ -5051,16 +5976,30 @@ function _possibleConstructorReturn(self, call) { if (!self) { throw new Referen
 
 function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
 
-var util = require('./util');
-var E = require('./util/constants').typeErrors;
-var LocalAudioTrack = require('./media/track/es5/localaudiotrack');
-var LocalDataTrack = require('./media/track/es5/localdatatrack');
-var LocalVideoTrack = require('./media/track/es5/localvideotrack');
-var MediaStreamTrack = require('@twilio/webrtc').MediaStreamTrack;
-var Participant = require('./participant');
+var _require = require('@twilio/webrtc'),
+    MediaStreamTrack = _require.MediaStreamTrack;
+
+var _require2 = require('./util'),
+    asLocalTrack = _require2.asLocalTrack,
+    asLocalTrackPublication = _require2.asLocalTrackPublication,
+    trackClass = _require2.trackClass;
+
+var _require3 = require('./util/constants'),
+    E = _require3.typeErrors,
+    trackPriority = _require3.trackPriority;
+
+var _require4 = require('./util/validate'),
+    validateLocalTrack = _require4.validateLocalTrack;
+
+var _require5 = require('./media/track/es5'),
+    LocalAudioTrack = _require5.LocalAudioTrack,
+    LocalDataTrack = _require5.LocalDataTrack,
+    LocalVideoTrack = _require5.LocalVideoTrack;
+
 var LocalAudioTrackPublication = require('./media/track/localaudiotrackpublication');
 var LocalDataTrackPublication = require('./media/track/localdatatrackpublication');
 var LocalVideoTrackPublication = require('./media/track/localvideotrackpublication');
+var Participant = require('./participant');
 
 /**
  * A {@link LocalParticipant} represents the local {@link Participant} in a
@@ -5074,6 +6013,11 @@ var LocalVideoTrackPublication = require('./media/track/localvideotrackpublicati
  *    The {@link LocalParticipant}'s {@link LocalTrackPublication}s
  * @property {Map<Track.SID, LocalVideoTrackPublication>} videoTracks -
  *    The {@link LocalParticipant}'s {@link LocalVideoTrackPublication}s
+ * @property {string} signalingRegion - The geographical region of the
+ *     signaling edge the {@link LocalParticipant} is connected to.
+ *
+ * @emits RemoteParticipant#reconnected
+ * @emits RemoteParticipant#reconnecting
  * @emits LocalParticipant#trackDimensionsChanged
  * @emits LocalParticipant#trackDisabled
  * @emits LocalParticipant#trackEnabled
@@ -5137,6 +6081,12 @@ var LocalParticipant = function (_Participant) {
       },
       _tracksToStop: {
         value: tracksToStop
+      },
+      signalingRegion: {
+        enumerable: true,
+        get: function get() {
+          return signaling.signalingRegion;
+        }
       }
     });
 
@@ -5148,16 +6098,17 @@ var LocalParticipant = function (_Participant) {
    * @private
    * @param {LocalTrack} track
    * @param {Track.ID} id
+   * @param {Track.Priority} priority
    * @returns {?LocalTrack}
    */
 
 
   _createClass(LocalParticipant, [{
     key: '_addTrack',
-    value: function _addTrack(track, id) {
+    value: function _addTrack(track, id, priority) {
       var addedTrack = _get(LocalParticipant.prototype.__proto__ || Object.getPrototypeOf(LocalParticipant.prototype), '_addTrack', this).call(this, track, id);
       if (addedTrack && this.state !== 'disconnected') {
-        this._addLocalTrack(track);
+        this._addLocalTrack(track, priority);
       }
       return addedTrack;
     }
@@ -5165,15 +6116,16 @@ var LocalParticipant = function (_Participant) {
     /**
      * @private
      * @param {LocalTrack} track
+     * @param {Track.Priority} priority
      * @returns {void}
      */
 
   }, {
     key: '_addLocalTrack',
-    value: function _addLocalTrack(track) {
-      this._signaling.addTrack(track._trackSender, track.name);
-      this._log.info('Added a new ' + util.trackClass(track, true) + ':', track.id);
-      this._log.debug(util.trackClass(track, true) + ':', track);
+    value: function _addLocalTrack(track, priority) {
+      this._signaling.addTrack(track._trackSender, track.name, priority);
+      this._log.info('Added a new ' + trackClass(track, true) + ':', track.id);
+      this._log.debug(trackClass(track, true) + ':', track);
     }
 
     /**
@@ -5189,8 +6141,8 @@ var LocalParticipant = function (_Participant) {
       var removedTrack = _get(LocalParticipant.prototype.__proto__ || Object.getPrototypeOf(LocalParticipant.prototype), '_removeTrack', this).call(this, track, id);
       if (removedTrack && this.state !== 'disconnected') {
         this._signaling.removeTrack(track._trackSender);
-        this._log.info('Removed a ' + util.trackClass(track, true) + ':', track.id);
-        this._log.debug(util.trackClass(track, true) + ':', track);
+        this._log.info('Removed a ' + trackClass(track, true) + ':', track.id);
+        this._log.debug(trackClass(track, true) + ':', track);
       }
       return removedTrack;
     }
@@ -5233,7 +6185,7 @@ var LocalParticipant = function (_Participant) {
         var trackSignaling = signaling.getPublication(localTrack._trackSender);
         if (trackSignaling) {
           trackSignaling.disable();
-          log.debug('Disabled the ' + util.trackClass(localTrack, true) + ':', localTrack.id);
+          log.debug('Disabled the ' + trackClass(localTrack, true) + ':', localTrack.id);
         }
       }
 
@@ -5241,7 +6193,7 @@ var LocalParticipant = function (_Participant) {
         var trackSignaling = signaling.getPublication(localTrack._trackSender);
         if (trackSignaling) {
           trackSignaling.enable();
-          log.debug('Enabled the ' + util.trackClass(localTrack, true) + ':', localTrack.id);
+          log.debug('Enabled the ' + trackClass(localTrack, true) + ':', localTrack.id);
         }
       }
 
@@ -5259,9 +6211,10 @@ var LocalParticipant = function (_Participant) {
       this.on('trackStopped', localTrackStopped);
 
       this._tracks.forEach(function (track) {
-        _this2._addLocalTrack(track);
-        _this2._getOrCreateLocalTrackPublication(track).catch(function () {
-          // Do nothing for now.
+        _this2._addLocalTrack(track, trackPriority.PRIORITY_STANDARD);
+        _this2._getOrCreateLocalTrackPublication(track).catch(function (error) {
+          // Just log a warning for now.
+          log.warn('Failed to get or create LocalTrackPublication for ' + track + ':', error);
         });
       });
 
@@ -5280,6 +6233,17 @@ var LocalParticipant = function (_Participant) {
           self._tracksToStop.forEach(function (track) {
             track.stop();
           });
+        } else if (state === 'connected') {
+          // NOTE(mmalavalli): Any transition to "connected" here is a result of
+          // successful signaling reconnection, and not a first-time establishment
+          // of the signaling connection.
+          log.info('reconnected');
+
+          // NOTE(mpatwardhan): `stateChanged` can get emitted with StateMachine locked.
+          // Do not signal  public events synchronously with lock held.
+          setTimeout(function () {
+            return self.emit('reconnected');
+          }, 0);
         }
       });
     }
@@ -5315,7 +6279,7 @@ var LocalParticipant = function (_Participant) {
           var error = trackSignaling.error;
           if (error) {
             trackSignaling.removeListener('updated', updated);
-            log.warn('Failed to publish the ' + util.trackClass(localTrack, true) + ': ' + error.message);
+            log.warn('Failed to publish the ' + trackClass(localTrack, true) + ': ' + error.message);
             self._removeTrack(localTrack, localTrack.id);
             setTimeout(function () {
               self.emit('trackPublicationFailed', error, localTrack);
@@ -5347,7 +6311,7 @@ var LocalParticipant = function (_Participant) {
           localTrackPublication = getTrackPublication(self.tracks, localTrack);
 
           if (!localTrackPublication) {
-            localTrackPublication = util.asLocalTrackPublication(localTrack, sid, unpublish, options);
+            localTrackPublication = asLocalTrackPublication(localTrack, trackSignaling, unpublish, options);
             self._addTrackPublication(localTrackPublication);
           }
 
@@ -5366,19 +6330,43 @@ var LocalParticipant = function (_Participant) {
     /**
      * Publishes a {@link LocalTrack} to the {@link Room}.
      * @param {LocalTrack} localTrack - The {@link LocalTrack} to publish
+     * @param {LocalTrackPublishOptions} [options] - The {@link LocalTrackPublishOptions}
+     *   for publishing the {@link LocalTrack}
      * @returns {Promise<LocalTrackPublication>} - Resolves with the corresponding
      *   {@link LocalTrackPublication} if successful
+     * @throws {TypeError}
+     * @throws {RangeError}
+     * @example
+     * var Video = require('twilio-video');
+     *
+     * Video.connect(token, {
+     *   name: 'my-cool-room',
+     *   audio: true
+     * }).then(function(room) {
+     *   return Video.createLocalVideoTrack({
+     *     name: 'camera'
+     *   }).then(function(localVideoTrack) {
+     *     return room.localParticipant.publishTrack(localVideoTrack, {
+     *       priority: 'high'
+     *     });
+     *   });
+     * }).then(function(publication) {
+     *   console.log('The LocalTrack "' + publication.trackName
+     *     + '" was successfully published with priority "'
+     *     * publication.priority + '"');
+     * });
     */ /**
        * Publishes a MediaStreamTrack to the {@link Room}.
        * @param {MediaStreamTrack} mediaStreamTrack - The MediaStreamTrack
        *   to publish; if a corresponding {@link LocalAudioTrack} or
        *   {@link LocalVideoTrack} has not yet been published, this method will
        *   construct one
-       * @param {LocalTrackOptions} [options] - The {@link LocalTrackOptions} for
-       *   constructing the  MediaStreamTrack's corresponding {@link LocalAudioTrack}
-       *   or {@link LocalVideoTrack}
+       * @param {MediaStreamTrackPublishOptions} [options] - The options for publishing
+       *   the MediaStreamTrack
        * @returns {Promise<LocalTrackPublication>} - Resolves with the corresponding
        *   {@link LocalTrackPublication} if successful
+       * @throws {TypeError}
+       * @throws {RangeError}
        * @example
        * var Video = require('twilio-video');
        *
@@ -5386,12 +6374,19 @@ var LocalParticipant = function (_Participant) {
        *   name: 'my-cool-room',
        *   audio: true
        * }).then(function(room) {
-       *   // Publish a video MediaStreamTrack with a custom name
-       *   return room.localParticipant.publishTrack(mediaStreamTrack, {
-       *     name: 'camera'
+       *   return navigator.mediaDevices.getUserMedia({
+       *     video: true
+       *   }).then(function(mediaStream) {
+       *     var mediaStreamTrack = mediaStream.getTracks()[0];
+       *     return room.localParticipant.publishTrack(mediaStreamTrack, {
+       *       name: 'camera',
+       *       priority: 'high'
+       *     });
        *   });
        * }).then(function(publication) {
-       *   console.log('The LocalTrack "' + publication.trackName + '" was successfully published');
+       *   console.log('The LocalTrack "' + publication.trackName
+       *     + '" was successfully published with priority "'
+       *     * publication.priority + '"');
        * });
        */
 
@@ -5405,6 +6400,7 @@ var LocalParticipant = function (_Participant) {
 
       options = Object.assign({
         log: this._log,
+        priority: trackPriority.PRIORITY_STANDARD,
         LocalAudioTrack: this._LocalAudioTrack,
         LocalDataTrack: this._LocalDataTrack,
         LocalVideoTrack: this._LocalVideoTrack,
@@ -5413,12 +6409,18 @@ var LocalParticipant = function (_Participant) {
 
       var localTrack = void 0;
       try {
-        localTrack = util.asLocalTrack(localTrackOrMediaStreamTrack, options);
+        localTrack = asLocalTrack(localTrackOrMediaStreamTrack, options);
       } catch (error) {
         return Promise.reject(error);
       }
 
-      var addedLocalTrack = this._addTrack(localTrack, localTrack.id) || this._tracks.get(localTrack.id);
+      var priorityValues = Object.values(trackPriority);
+      if (!priorityValues.includes(options.priority)) {
+        // eslint-disable-next-line new-cap
+        return Promise.reject(E.INVALID_VALUE('LocalTrackPublishOptions.priority', priorityValues));
+      }
+
+      var addedLocalTrack = this._addTrack(localTrack, localTrack.id, options.priority) || this._tracks.get(localTrack.id);
 
       return this._getOrCreateLocalTrackPublication(addedLocalTrack);
     }
@@ -5442,6 +6444,11 @@ var LocalParticipant = function (_Participant) {
         throw E.INVALID_TYPE('tracks', 'Array of LocalAudioTrack, LocalVideoTrack, LocalDataTrack, or MediaStreamTrack');
       }
       return Promise.all(tracks.map(this.publishTrack, this));
+    }
+  }, {
+    key: 'setBandwidthProfile',
+    value: function setBandwidthProfile() {
+      this._log.warn('setBandwidthProfile is not implemented yet and may be available in future versions of twilio-video.js');
     }
 
     /**
@@ -5479,7 +6486,7 @@ var LocalParticipant = function (_Participant) {
         throw E.INVALID_TYPE('networkQualityConfiguration', 'NetworkQualityConfiguration');
       }
       ['local', 'remote'].forEach(function (prop) {
-        if (prop in networkQualityConfiguration && typeof networkQualityConfiguration[prop] !== 'number') {
+        if (prop in networkQualityConfiguration && (typeof networkQualityConfiguration[prop] !== 'number' || isNaN(networkQualityConfiguration[prop]))) {
           // eslint-disable-next-line new-cap
           throw E.INVALID_TYPE('networkQualityConfiguration.' + prop, 'number');
         }
@@ -5535,7 +6542,7 @@ var LocalParticipant = function (_Participant) {
   }, {
     key: 'unpublishTrack',
     value: function unpublishTrack(track) {
-      util.validateLocalTrack(track, {
+      validateLocalTrack(track, {
         LocalAudioTrack: this._LocalAudioTrack,
         LocalDataTrack: this._LocalDataTrack,
         LocalVideoTrack: this._LocalVideoTrack,
@@ -5594,6 +6601,16 @@ var LocalParticipant = function (_Participant) {
 }(Participant);
 
 /**
+ * The {@link LocalParticipant} has reconnected to the {@link Room} after a signaling connection disruption.
+ * @event LocalParticipant#reconnected
+ */
+
+/**
+ * The {@link LocalParticipant} is reconnecting to the {@link Room} after a signaling connection disruption.
+ * @event LocalParticipant#reconnecting
+ */
+
+/**
  * One of the {@link LocalParticipant}'s {@link LocalVideoTrack}'s dimensions changed.
  * @param {LocalVideoTrack} track - The {@link LocalVideoTrack} whose dimensions changed
  * @event LocalParticipant#trackDimensionsChanged
@@ -5646,11 +6663,38 @@ var LocalParticipant = function (_Participant) {
  * Outgoing media encoding parameters.
  * @typedef {object} EncodingParameters
  * @property {?number} [maxAudioBitrate] - Max outgoing audio bitrate (bps);
- *   If not specified, retains the existing bitrate limit; A <code>null</code>
- *   value removes any previously set bitrate limit
+ *   If not specified, retains the existing bitrate limit; A <code>null</code> or a
+ *   <code>0</code> value removes any previously set bitrate limit; This value is set
+ *   as a hint for variable bitrate codecs, but will not take effect for fixed bitrate
+ *   codecs; Based on our tests, Chrome, Firefox and Safari support a bitrate range of
+ *   12000 bps to 256000 bps for Opus codec; This parameter has no effect on iSAC, PCMU
+ *   and PCMA codecs
  * @property {?number} [maxVideoBitrate] - Max outgoing video bitrate (bps);
- *   If not specified, retains the existing bitrate limit; A <code>null</code>
- *   value removes any previously set bitrate limit
+ *   If not specified, retains the existing bitrate limit; A <code>null</code> or
+ *   a <code>0</code> value removes any previously set bitrate limit; This value is
+ *   set as a hint for variable bitrate codecs, but will not take effect for fixed
+ *   bitrate codecs; Based on our tests, Chrome, Firefox and Safari all seem to support
+ *   an average bitrate range of 20000 bps (20 kbps) to 8000000 bps (8 mbps) for a
+ *   720p VideoTrack.
+ *   Note: this limit is not applied for screen share tracks published on Chrome.
+ */
+
+/**
+ * Options for publishing a {@link LocalTrack}.
+ * @typedef {object} LocalTrackPublishOptions
+ * @property {Track.Priority} [priority='standard'] - The priority with which the {@link LocalTrack}
+ *   is to be published; In Group or Small Group Rooms, the appropriate bandwidth is
+ *   allocated to the {@link LocalTrack} based on its {@link Track.Priority}; It has no
+ *   effect in Peer-to-Peer Rooms; It defaults to "standard" when not provided
+ */
+
+/**
+ * Options for publishing a {@link MediaStreamTrack}.
+ * @typedef {LocalTrackOptions} MediaStreamTrackPublishOptions
+ * @property {Track.Priority} [priority='standard'] - The priority with which the {@link LocalTrack}
+ *   is to be published; In Group or Small Group Rooms, the appropriate bandwidth is
+ *   allocated to the {@link LocalTrack} based on its {@link Track.Priority}; It has no
+ *   effect in Peer-to-Peer Rooms; It defaults to "standard" when not provided
  */
 
 /**
@@ -5668,7 +6712,7 @@ function getTrackPublication(trackPublications, track) {
 }
 
 module.exports = LocalParticipant;
-},{"./media/track/es5/localaudiotrack":38,"./media/track/es5/localdatatrack":39,"./media/track/es5/localvideotrack":40,"./media/track/localaudiotrackpublication":43,"./media/track/localdatatrackpublication":45,"./media/track/localvideotrackpublication":49,"./participant":65,"./util":132,"./util/constants":130,"@twilio/webrtc":3}],37:[function(require,module,exports){
+},{"./media/track/es5":47,"./media/track/localaudiotrackpublication":53,"./media/track/localdatatrackpublication":55,"./media/track/localvideotrackpublication":59,"./participant":75,"./util":144,"./util/constants":142,"./util/validate":159,"@twilio/webrtc":3}],46:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -5849,7 +6893,16 @@ var AudioTrack = function (_MediaTrack) {
  */
 
 module.exports = AudioTrack;
-},{"./mediatrack":50}],38:[function(require,module,exports){
+},{"./mediatrack":60}],47:[function(require,module,exports){
+'use strict';
+
+module.exports = {
+  LocalAudioTrack: require('./localaudiotrack'),
+  LocalVideoTrack: require('./localvideotrack'),
+  LocalDataTrack: require('./localdatatrack')
+};
+},{"./localaudiotrack":48,"./localdatatrack":49,"./localvideotrack":50}],48:[function(require,module,exports){
+// eslint-disable-next-line no-warning-comments
 // TODO(mroberts): Remove this when we go to the next major version. This is
 // only in place so that we can support ES6 classes without requiring `new`.
 'use strict';
@@ -5868,7 +6921,8 @@ function LocalAudioTrack(mediaStreamTrack, options) {
 inherits(LocalAudioTrack, LocalAudioTrackClass);
 
 module.exports = LocalAudioTrack;
-},{"../localaudiotrack":42,"util":154}],39:[function(require,module,exports){
+},{"../localaudiotrack":52,"util":167}],49:[function(require,module,exports){
+// eslint-disable-next-line no-warning-comments
 // TODO(mroberts): Remove this when we go to the next major version. This is
 // only in place so that we can support ES6 classes without requiring `new`.
 'use strict';
@@ -5887,7 +6941,8 @@ function LocalDataTrack(options) {
 inherits(LocalDataTrack, LocalDataTrackClass);
 
 module.exports = LocalDataTrack;
-},{"../localdatatrack":44,"util":154}],40:[function(require,module,exports){
+},{"../localdatatrack":54,"util":167}],50:[function(require,module,exports){
+// eslint-disable-next-line no-warning-comments
 // TODO(mroberts): Remove this when we go to the next major version. This is
 // only in place so that we can support ES6 classes without requiring `new`.
 'use strict';
@@ -5906,7 +6961,7 @@ function LocalVideoTrack(mediaStreamTrack, options) {
 inherits(LocalVideoTrack, LocalVideoTrackClass);
 
 module.exports = LocalVideoTrack;
-},{"../localvideotrack":48,"util":154}],41:[function(require,module,exports){
+},{"../localvideotrack":58,"util":167}],51:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -6000,6 +7055,11 @@ var Track = function (_EventEmitter) {
  */
 
 /**
+ * The {@link Track}'s priority can be "low", "standard", or "high".
+ * @typedef {string} Track.Priority
+ */
+
+/**
  * The {@link Track} SID is a unique string identifier for the {@link Track}
  * that is published to a {@link Room}.
  * @typedef {string} Track.SID
@@ -6031,7 +7091,7 @@ var Track = function (_EventEmitter) {
  */
 
 module.exports = Track;
-},{"../../eventemitter":32,"../../util":132,"../../util/constants":130,"../../util/log":135}],42:[function(require,module,exports){
+},{"../../eventemitter":41,"../../util":144,"../../util/constants":142,"../../util/log":147}],52:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -6180,7 +7240,7 @@ var LocalAudioTrack = function (_LocalMediaAudioTrack) {
  */
 
 module.exports = LocalAudioTrack;
-},{"./audiotrack":37,"./localmediatrack":46}],43:[function(require,module,exports){
+},{"./audiotrack":46,"./localmediatrack":56}],53:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -6206,16 +7266,17 @@ var LocalAudioTrackPublication = function (_LocalTrackPublicatio) {
 
   /**
    * Construct a {@link LocalAudioTrackPublication}.
-   * @param {Track.SID} trackSid - SID assigned to the published {@link LocalAudioTrack}
+   * @param {LocalTrackPublicationSignaling} signaling - The corresponding
+   *   {@link LocalTrackPublicationSignaling}
    * @param {LocalAudioTrack} track - the {@link LocalAudioTrack}
    * @param {function(LocalTrackPublication): void} unpublish - The callback
    *    that unpublishes the {@link LocalTrackPublication}
    * @param {TrackPublicationOptions} options - {@link LocalTrackPublication} options
    */
-  function LocalAudioTrackPublication(trackSid, track, unpublish, options) {
+  function LocalAudioTrackPublication(signaling, track, unpublish, options) {
     _classCallCheck(this, LocalAudioTrackPublication);
 
-    return _possibleConstructorReturn(this, (LocalAudioTrackPublication.__proto__ || Object.getPrototypeOf(LocalAudioTrackPublication)).call(this, trackSid, track, unpublish, options));
+    return _possibleConstructorReturn(this, (LocalAudioTrackPublication.__proto__ || Object.getPrototypeOf(LocalAudioTrackPublication)).call(this, signaling, track, unpublish, options));
   }
 
   _createClass(LocalAudioTrackPublication, [{
@@ -6229,7 +7290,7 @@ var LocalAudioTrackPublication = function (_LocalTrackPublicatio) {
 }(LocalTrackPublication);
 
 module.exports = LocalAudioTrackPublication;
-},{"./localtrackpublication":47}],44:[function(require,module,exports){
+},{"./localtrackpublication":57}],54:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -6375,7 +7436,7 @@ var LocalDataTrack = function (_Track) {
  */
 
 module.exports = LocalDataTrack;
-},{"../../data/sender":27,"./":41}],45:[function(require,module,exports){
+},{"../../data/sender":36,"./":51}],55:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -6401,16 +7462,17 @@ var LocalDataTrackPublication = function (_LocalTrackPublicatio) {
 
   /**
    * Construct a {@link LocalDataTrackPublication}.
-   * @param {Track.SID} trackSid - SID assigned to the published {@link LocalDataTrack}
+   * @param {LocalTrackPublicationSignaling} signaling - The corresponding
+   *   {@link LocalTrackPublicationSignaling}
    * @param {LocalDataTrack} track - the {@link LocalDataTrack}
    * @param {function(LocalTrackPublication): void} unpublish - The callback
    *    that unpublishes the {@link LocalTrackPublication}
    * @param {TrackPublicationOptions} options - {@link LocalTrackPublication} options
    */
-  function LocalDataTrackPublication(trackSid, track, unpublish, options) {
+  function LocalDataTrackPublication(signaling, track, unpublish, options) {
     _classCallCheck(this, LocalDataTrackPublication);
 
-    return _possibleConstructorReturn(this, (LocalDataTrackPublication.__proto__ || Object.getPrototypeOf(LocalDataTrackPublication)).call(this, trackSid, track, unpublish, options));
+    return _possibleConstructorReturn(this, (LocalDataTrackPublication.__proto__ || Object.getPrototypeOf(LocalDataTrackPublication)).call(this, signaling, track, unpublish, options));
   }
 
   _createClass(LocalDataTrackPublication, [{
@@ -6424,7 +7486,7 @@ var LocalDataTrackPublication = function (_LocalTrackPublicatio) {
 }(LocalTrackPublication);
 
 module.exports = LocalDataTrackPublication;
-},{"./localtrackpublication":47}],46:[function(require,module,exports){
+},{"./localtrackpublication":57}],56:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -6539,7 +7601,8 @@ function mixinLocalMediaTrack(AudioOrVideoTrack) {
 }
 
 module.exports = mixinLocalMediaTrack;
-},{"./sender":60}],47:[function(require,module,exports){
+},{"./sender":70}],57:[function(require,module,exports){
+/* eslint new-cap:0 */
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -6552,37 +7615,48 @@ function _inherits(subClass, superClass) { if (typeof superClass !== "function" 
 
 var TrackPublication = require('./trackpublication');
 
+var _require = require('../../util/constants'),
+    E = _require.typeErrors,
+    trackPriority = _require.trackPriority;
+
 /**
  * A {@link LocalTrackPublication} is a {@link LocalTrack} that has been
  * published to a {@link Room}.
+ * @extends TrackPublication
  * @property {boolean} isTrackEnabled - whether the published {@link LocalTrack}
  *   is enabled
  * @property {Track.Kind} kind - kind of the published {@link LocalTrack}
+ * @property {Track.Priority} priority - the publish priority of the {@link LocalTrack}
  * @property {LocalTrack} track - the {@link LocalTrack}
  */
+
 
 var LocalTrackPublication = function (_TrackPublication) {
   _inherits(LocalTrackPublication, _TrackPublication);
 
   /**
    * Construct a {@link LocalTrackPublication}.
-   * @param {Track.SID} trackSid - SID assigned to the published {@link LocalTrack}
-   * @param {LocalTrack} track - the {@link LocalTrack}
+   * @param {LocalTrackPublicationSignaling} signaling - The corresponding
+   *   {@link LocalTrackPublicationSignaling}
+   * @param {LocalTrack} track - The {@link LocalTrack}
    * @param {function(LocalTrackPublication): void} unpublish - The callback
    *   that unpublishes the {@link LocalTrackPublication}
    * @param {TrackPublicationOptions} options - {@link LocalTrackPublication}
    *   options
    */
-  function LocalTrackPublication(trackSid, track, unpublish, options) {
+  function LocalTrackPublication(signaling, track, unpublish, options) {
     _classCallCheck(this, LocalTrackPublication);
 
-    var _this = _possibleConstructorReturn(this, (LocalTrackPublication.__proto__ || Object.getPrototypeOf(LocalTrackPublication)).call(this, track.name, trackSid, options));
+    var _this = _possibleConstructorReturn(this, (LocalTrackPublication.__proto__ || Object.getPrototypeOf(LocalTrackPublication)).call(this, track.name, signaling.sid, options));
 
     Object.defineProperties(_this, {
       _reemitTrackEvent: {
         value: function value() {
           return _this.emit(_this.isTrackEnabled ? 'trackEnabled' : 'trackDisabled');
         }
+      },
+      _signaling: {
+        value: signaling
       },
       _unpublish: {
         value: unpublish
@@ -6596,6 +7670,12 @@ var LocalTrackPublication = function (_TrackPublication) {
       kind: {
         enumerable: true,
         value: track.kind
+      },
+      priority: {
+        enumerable: true,
+        get: function get() {
+          return signaling.updatedPriority;
+        }
       },
       track: {
         enumerable: true,
@@ -6612,6 +7692,24 @@ var LocalTrackPublication = function (_TrackPublication) {
     key: 'toString',
     value: function toString() {
       return '[LocalTrackPublication #' + this._instanceId + ': ' + this.trackSid + ']';
+    }
+
+    /**
+     * Update the {@link Track.Priority} of the published {@link LocalTrack}.
+     * @param {Track.Priority} priority - the new {@link Track.priority}
+     * @returns {this}
+     * @throws {RangeError}
+     */
+
+  }, {
+    key: 'setPriority',
+    value: function setPriority(priority) {
+      var priorityValues = Object.values(trackPriority);
+      if (!priorityValues.includes(priority)) {
+        throw E.INVALID_VALUE('priority', priorityValues);
+      }
+      this._signaling.setPriority(priority);
+      return this;
     }
 
     /**
@@ -6635,7 +7733,7 @@ var LocalTrackPublication = function (_TrackPublication) {
 }(TrackPublication);
 
 module.exports = LocalTrackPublication;
-},{"./trackpublication":61}],48:[function(require,module,exports){
+},{"../../util/constants":142,"./trackpublication":71}],58:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -6663,6 +7761,9 @@ var LocalMediaVideoTrack = mixinLocalMediaTrack(VideoTrack);
  * @property {Track.ID} id - The {@link LocalVideoTrack}'s ID
  * @property {boolean} isStopped - Whether or not the {@link LocalVideoTrack} is
  *   stopped
+ * @emits LocalVideoTrack#disabled
+ * @emits LocalVideoTrack#enabled
+ * @emits LocalVideoTrack#started
  * @emits LocalVideoTrack#stopped
  */
 
@@ -6774,7 +7875,7 @@ var LocalVideoTrack = function (_LocalMediaVideoTrack) {
  */
 
 module.exports = LocalVideoTrack;
-},{"./localmediatrack":46,"./videotrack":63}],49:[function(require,module,exports){
+},{"./localmediatrack":56,"./videotrack":73}],59:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -6800,16 +7901,17 @@ var LocalVideoTrackPublication = function (_LocalTrackPublicatio) {
 
   /**
    * Construct a {@link LocalVideoTrackPublication}.
-   * @param {Track.SID} trackSid - SID assigned to the published {@link LocalVideoTrack}
+   * @param {LocalTrackPublicationSignaling} signaling - The corresponding
+   *   {@link LocalTrackPublicationSignaling}
    * @param {LocalVideoTrack} track - the {@link LocalVideoTrack}
    * @param {function(LocalTrackPublication): void} unpublish - The callback
    *    that unpublishes the {@link LocalTrackPublication}
    * @param {TrackPublicationOptions} options - {@link LocalTrackPublication} options
    */
-  function LocalVideoTrackPublication(trackSid, track, unpublish, options) {
+  function LocalVideoTrackPublication(signaling, track, unpublish, options) {
     _classCallCheck(this, LocalVideoTrackPublication);
 
-    return _possibleConstructorReturn(this, (LocalVideoTrackPublication.__proto__ || Object.getPrototypeOf(LocalVideoTrackPublication)).call(this, trackSid, track, unpublish, options));
+    return _possibleConstructorReturn(this, (LocalVideoTrackPublication.__proto__ || Object.getPrototypeOf(LocalVideoTrackPublication)).call(this, signaling, track, unpublish, options));
   }
 
   _createClass(LocalVideoTrackPublication, [{
@@ -6823,7 +7925,7 @@ var LocalVideoTrackPublication = function (_LocalTrackPublicatio) {
 }(LocalTrackPublication);
 
 module.exports = LocalVideoTrackPublication;
-},{"./localtrackpublication":47}],50:[function(require,module,exports){
+},{"./localtrackpublication":57}],60:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -6998,11 +8100,8 @@ var MediaTrack = function (_Track) {
       });
       mediaStream.addTrack(this.mediaStreamTrack);
 
-      // NOTE(mroberts): Although we don't necessarily need to reset `srcObject`,
-      // we've been doing it here for a while, and it turns out it has allowed us
-      // to sidestep the following issue:
-      //
-      //   https://bugs.chromium.org/p/chromium/issues/detail?id=720258
+      // NOTE(mpatwardhan): resetting `srcObject` here, causes flicker (JSDK-2641), but it lets us
+      // to sidestep the a chrome bug: https://bugs.chromium.org/p/chromium/issues/detail?id=1052353
       //
       el.srcObject = mediaStream;
       el.autoplay = true;
@@ -7082,14 +8181,6 @@ var MediaTrack = function (_Track) {
       var mediaStream = el.srcObject;
       if (mediaStream instanceof this._MediaStream) {
         mediaStream.removeTrack(this.mediaStreamTrack);
-        // NOTE(mroberts): It's as if, in Chrome and Safari, the <audio> element's
-        // `srcObject` setter is taking a "snapshot" of the MediaStream's
-        // MediaStreamTracks in order to playback; hence, calls to `removeTrack`
-        // don't take effect unless you set the <audio> element's `srcObject` again.
-        //
-        //   https://bugs.chromium.org/p/chromium/issues/detail?id=749928
-        //
-        el.srcObject = mediaStream;
       }
 
       this._attachments.delete(el);
@@ -7117,7 +8208,7 @@ var MediaTrack = function (_Track) {
 }(Track);
 
 module.exports = MediaTrack;
-},{"./":41,"@twilio/webrtc":3}],51:[function(require,module,exports){
+},{"./":51,"@twilio/webrtc":3}],61:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -7151,10 +8242,12 @@ var MediaTrackReceiver = function (_MediaTrackTransceive) {
 }(MediaTrackTransceiver);
 
 module.exports = MediaTrackReceiver;
-},{"./transceiver":62}],52:[function(require,module,exports){
+},{"./transceiver":72}],62:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
+
+var _get = function get(object, property, receiver) { if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { return get(parent, property, receiver); } } else if ("value" in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } };
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
@@ -7171,10 +8264,15 @@ var RemoteMediaAudioTrack = mixinRemoteMediaTrack(AudioTrack);
  * A {@link RemoteAudioTrack} represents an {@link AudioTrack} published to a
  * {@link Room} by a {@link RemoteParticipant}.
  * @extends AudioTrack
+ * @property {boolean} isEnabled - Whether the {@link RemoteAudioTrack} is enabled
+ * @property {boolean} isSwitchedOff - Whether the {@link RemoteAudioTrack} is switched off
  * @property {Track.SID} sid - The {@link RemoteAudioTrack}'s SID
+ * @property {?Track.Priority} priority - The subscribe priority of the {@link RemoteAudioTrack}
  * @emits RemoteAudioTrack#disabled
  * @emits RemoteAudioTrack#enabled
  * @emits RemoteAudioTrack#started
+ * @emits RemoteAudioTrack#switchedOff
+ * @emits RemoteAudioTrack#switchedOn
  */
 
 var RemoteAudioTrack = function (_RemoteMediaAudioTrac) {
@@ -7185,18 +8283,34 @@ var RemoteAudioTrack = function (_RemoteMediaAudioTrac) {
    * @param {Track.SID} sid - The {@link RemoteAudioTrack}'s SID
    * @param {MediaTrackReceiver} mediaTrackReceiver - An audio MediaStreamTrack container
    * @param {boolean} isEnabled - Whether the {@link RemoteAudioTrack} is enabled
+   * @param {function(?Track.Priority): void} setPriority - Set or clear the subscribe
+   *  {@link Track.Priority} of the {@link RemoteAudioTrack}
    * @param {{log: Log}} options - The {@link RemoteTrack} options
    */
-  function RemoteAudioTrack(sid, mediaTrackReceiver, isEnabled, options) {
+  function RemoteAudioTrack(sid, mediaTrackReceiver, isEnabled, setPriority, options) {
     _classCallCheck(this, RemoteAudioTrack);
 
-    return _possibleConstructorReturn(this, (RemoteAudioTrack.__proto__ || Object.getPrototypeOf(RemoteAudioTrack)).call(this, sid, mediaTrackReceiver, isEnabled, options));
+    return _possibleConstructorReturn(this, (RemoteAudioTrack.__proto__ || Object.getPrototypeOf(RemoteAudioTrack)).call(this, sid, mediaTrackReceiver, isEnabled, setPriority, options));
   }
 
   _createClass(RemoteAudioTrack, [{
     key: 'toString',
     value: function toString() {
       return '[RemoteAudioTrack #' + this._instanceId + ': ' + this.sid + ']';
+    }
+
+    /**
+     * Update the subscribe {@link Track.Priority} of the {@link RemoteAudioTrack}.
+     * @param {?Track.Priority} priority - the new subscribe {@link Track.Priority};
+     *   Currently setPriority has no effect on audio tracks.
+     * @returns {this}
+     * @throws {RangeError}
+     */
+
+  }, {
+    key: 'setPriority',
+    value: function setPriority(priority) {
+      return _get(RemoteAudioTrack.prototype.__proto__ || Object.getPrototypeOf(RemoteAudioTrack.prototype), 'setPriority', this).call(this, priority);
     }
   }]);
 
@@ -7224,8 +8338,22 @@ var RemoteAudioTrack = function (_RemoteMediaAudioTrac) {
  * @event RemoteAudioTrack#started
  */
 
+/**
+ * A {@link RemoteAudioTrack} was switched off.
+ * @param {RemoteAudioTrack} track - The {@link RemoteAudioTrack} that was
+ *   switched off
+ * @event RemoteAudioTrack#switchedOff
+ */
+
+/**
+ * A {@link RemoteAudioTrack} was switched on.
+ * @param {RemoteAudioTrack} track - The {@link RemoteAudioTrack} that was
+ *   switched on
+ * @event RemoteAudioTrack#switchedOn
+ */
+
 module.exports = RemoteAudioTrack;
-},{"./audiotrack":37,"./remotemediatrack":56}],53:[function(require,module,exports){
+},{"./audiotrack":46,"./remotemediatrack":66}],63:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -7306,10 +8434,12 @@ var RemoteAudioTrackPublication = function (_RemoteTrackPublicati) {
  */
 
 module.exports = RemoteAudioTrackPublication;
-},{"./remotetrackpublication":57}],54:[function(require,module,exports){
+},{"./remotetrackpublication":67}],64:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
+
+function _toConsumableArray(arr) { if (Array.isArray(arr)) { for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) { arr2[i] = arr[i]; } return arr2; } else { return Array.from(arr); } }
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
@@ -7319,6 +8449,10 @@ function _inherits(subClass, superClass) { if (typeof superClass !== "function" 
 
 var Track = require('./');
 
+var _require = require('../../util/constants'),
+    E = _require.typeErrors,
+    trackPriority = _require.trackPriority;
+
 /**
  * A {@link RemoteDataTrack} represents data published to a {@link Room} by a
  * {@link RemoteParticipant}.
@@ -7326,6 +8460,8 @@ var Track = require('./');
  * @property {boolean} isEnabled - true
  * @property {boolean} isSubscribed - Whether the {@link RemoteDataTrack} is
  *   subscribed to
+ * @property {boolean} isSwitchedOff - Whether the {@link RemoteDataTrack} is
+ *   switched off
  * @property {Track.Kind} kind - "data"
  * @property {?number} maxPacketLifeTime - If non-null, this represents a time
  *   limit (in milliseconds) during which data will be transmitted or
@@ -7335,6 +8471,7 @@ var Track = require('./');
  *   underlying RTCDataChannel.
  * @property {boolean} ordered - true if data on the {@link RemoteDataTrack} can
  *   be received out-of-order.
+ * @property {?Track.Priority} priority - The subscribe priority of the {@link RemoteDataTrack}
  * @property {boolean} reliable - This is true if both
  *   <code>maxPacketLifeTime</code> and <code>maxRetransmits</code> are set to
  *   null. In other words, if this is true, there is no bound on packet lifetime
@@ -7342,7 +8479,10 @@ var Track = require('./');
  *   transmission.
  * @property {Track.SID} sid - The SID assigned to the {@link RemoteDataTrack}
  * @emits RemoteDataTrack#message
+ * @emits RemoteDataTrack#switchedOff
+ * @emits RemoteDataTrack#switchedOn
  */
+
 
 var RemoteDataTrack = function (_Track) {
   _inherits(RemoteDataTrack, _Track);
@@ -7359,9 +8499,23 @@ var RemoteDataTrack = function (_Track) {
     var _this = _possibleConstructorReturn(this, (RemoteDataTrack.__proto__ || Object.getPrototypeOf(RemoteDataTrack)).call(this, dataTrackReceiver.id, 'data', options));
 
     Object.defineProperties(_this, {
+      _isSwitchedOff: {
+        value: false,
+        writable: true
+      },
+      _priority: {
+        value: null,
+        writable: true
+      },
       isEnabled: {
         enumerable: true,
         value: true
+      },
+      isSwitchedOff: {
+        enumerable: true,
+        get: function get() {
+          return this._isSwitchedOff;
+        }
       },
       maxPacketLifeTime: {
         enumerable: true,
@@ -7374,6 +8528,12 @@ var RemoteDataTrack = function (_Track) {
       ordered: {
         enumerable: true,
         value: dataTrackReceiver.ordered
+      },
+      priority: {
+        enumerable: true,
+        get: function get() {
+          return this._priority;
+        }
       },
       reliable: {
         enumerable: true,
@@ -7392,14 +8552,50 @@ var RemoteDataTrack = function (_Track) {
   }
 
   /**
-   * @private
+   * Update the subscriber {@link Track.Priority} of the {@link RemoteDataTrack}.
+   * @param {?Track.Priority} priority - the new {@link Track.priority};
+   *   Currently setPriority has no effect on data tracks.
+   * @returns {this}
+   * @throws {RangeError}
    */
 
 
   _createClass(RemoteDataTrack, [{
+    key: 'setPriority',
+    value: function setPriority(priority) {
+      var priorityValues = [null].concat(_toConsumableArray(Object.values(trackPriority)));
+      if (!priorityValues.includes(priority)) {
+        // eslint-disable-next-line new-cap
+        throw E.INVALID_VALUE('priority', priorityValues);
+      }
+
+      // Note: priority has no real effect on the data tracks.
+      this._priority = priority;
+      return this;
+    }
+
+    /**
+     * @private
+     */
+
+  }, {
     key: '_setEnabled',
-    value: function _setEnabled() {
-      // Do nothing.
+    value: function _setEnabled() {}
+    // Do nothing.
+
+
+    /**
+     * @private
+     * @param {boolean} isSwitchedOff
+     */
+
+  }, {
+    key: '_setSwitchedOff',
+    value: function _setSwitchedOff(isSwitchedOff) {
+      if (this._isSwitchedOff !== isSwitchedOff) {
+        this._isSwitchedOff = isSwitchedOff;
+        this.emit(isSwitchedOff ? 'switchedOff' : 'switchedOn', this);
+      }
     }
   }]);
 
@@ -7414,8 +8610,22 @@ var RemoteDataTrack = function (_Track) {
  *   the message
  */
 
+/**
+ * A {@link RemoteDataTrack} was switched off.
+ * @param {RemoteDataTrack} track - The {@link RemoteDataTrack} that was
+ *   switched off
+ * @event RemoteDataTrack#switchedOff
+ */
+
+/**
+ * A {@link RemoteDataTrack} was switched on.
+ * @param {RemoteDataTrack} track - The {@link RemoteDataTrack} that was
+ *   switched on
+ * @event RemoteDataTrack#switchedOn
+ */
+
 module.exports = RemoteDataTrack;
-},{"./":41}],55:[function(require,module,exports){
+},{"../../util/constants":142,"./":51}],65:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -7484,10 +8694,14 @@ var RemoteDataTrackPublication = function (_RemoteTrackPublicati) {
  */
 
 module.exports = RemoteDataTrackPublication;
-},{"./remotetrackpublication":57}],56:[function(require,module,exports){
+},{"./remotetrackpublication":67}],66:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
+
+var _get = function get(object, property, receiver) { if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { return get(parent, property, receiver); } } else if ("value" in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } };
+
+function _toConsumableArray(arr) { if (Array.isArray(arr)) { for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) { arr2[i] = arr[i]; } return arr2; } else { return Array.from(arr); } }
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
@@ -7495,13 +8709,22 @@ function _possibleConstructorReturn(self, call) { if (!self) { throw new Referen
 
 function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
 
+var _require = require('../../util/constants'),
+    E = _require.typeErrors,
+    trackPriority = _require.trackPriority;
+
 function mixinRemoteMediaTrack(AudioOrVideoTrack) {
   /**
    * A {@link RemoteMediaTrack} represents a {@link MediaTrack} published to a
    * {@link Room} by a {@link RemoteParticipant}.
+   * @property {boolean} isEnabled - Whether the {@link RemoteMediaTrack} is enabled
+   * @property {boolean} isSwitchedOff - Whether the {@link RemoteMediaTrack} is switched off
    * @property {Track.SID} sid - The SID assigned to the {@link RemoteMediaTrack}
+   * @property {?Track.Priority} priority - The subscribe priority of the {@link RemoteMediaTrack}
    * @emits RemoteMediaTrack#disabled
    * @emits RemoteMediaTrack#enabled
+   * @emits RemoteMediaTrack#switchedOff
+   * @emits RemoteMediaTrack#switchedOn
    */
   return function (_AudioOrVideoTrack) {
     _inherits(RemoteMediaTrack, _AudioOrVideoTrack);
@@ -7511,9 +8734,11 @@ function mixinRemoteMediaTrack(AudioOrVideoTrack) {
      * @param {Track.SID} sid
      * @param {MediaTrackReceiver} mediaTrackReceiver
      * @param {boolean} isEnabled
+     * @param {function(?Track.Priority): void} setPriority - Set or clear the subscribe
+     *  {@link Track.Priority} of the {@link RemoteMediaTrack}
      * @param {{log: Log, name: ?string}} options
      */
-    function RemoteMediaTrack(sid, mediaTrackReceiver, isEnabled, options) {
+    function RemoteMediaTrack(sid, mediaTrackReceiver, isEnabled, setPriority, options) {
       _classCallCheck(this, RemoteMediaTrack);
 
       var _this = _possibleConstructorReturn(this, (RemoteMediaTrack.__proto__ || Object.getPrototypeOf(RemoteMediaTrack)).call(this, mediaTrackReceiver, options));
@@ -7523,10 +8748,33 @@ function mixinRemoteMediaTrack(AudioOrVideoTrack) {
           value: isEnabled,
           writable: true
         },
+        _isSwitchedOff: {
+          value: false,
+          writable: true
+        },
+        _priority: {
+          value: null,
+          writable: true
+        },
+        _setPriority: {
+          value: setPriority
+        },
         isEnabled: {
           enumerable: true,
           get: function get() {
             return this._isEnabled;
+          }
+        },
+        isSwitchedOff: {
+          enumerable: true,
+          get: function get() {
+            return this._isSwitchedOff;
+          }
+        },
+        priority: {
+          enumerable: true,
+          get: function get() {
+            return this._priority;
           }
         },
         sid: {
@@ -7538,18 +8786,82 @@ function mixinRemoteMediaTrack(AudioOrVideoTrack) {
     }
 
     /**
-     * @private
-     * @param {boolean} isEnabled
+     * Update the subscribe {@link Track.Priority} of the {@link RemoteMediaTrack}.
+     * @param {?Track.Priority} priority - the new subscribe {@link Track.Priority};
+     *   If <code>null</code>, then the subscribe {@link Track.Priority} is cleared, which
+     *   means the {@link Track.Priority} set by the publisher is now the effective priority.
+     * @returns {this}
+     * @throws {RangeError}
      */
 
 
     _createClass(RemoteMediaTrack, [{
+      key: 'setPriority',
+      value: function setPriority(priority) {
+        var priorityValues = [null].concat(_toConsumableArray(Object.values(trackPriority)));
+        if (!priorityValues.includes(priority)) {
+          // eslint-disable-next-line new-cap
+          throw E.INVALID_VALUE('priority', priorityValues);
+        }
+        if (this._priority !== priority) {
+          this._priority = priority;
+          this._setPriority(priority);
+        }
+        return this;
+      }
+
+      /**
+       * @private
+       * @param {boolean} isEnabled
+       */
+
+    }, {
       key: '_setEnabled',
       value: function _setEnabled(isEnabled) {
         if (this._isEnabled !== isEnabled) {
           this._isEnabled = isEnabled;
           this.emit(this._isEnabled ? 'enabled' : 'disabled', this);
         }
+      }
+
+      /**
+       * @private
+       * @param {boolean} isSwitchedOff
+       */
+
+    }, {
+      key: '_setSwitchedOff',
+      value: function _setSwitchedOff(isSwitchedOff) {
+        if (this._isSwitchedOff !== isSwitchedOff) {
+          this._isSwitchedOff = isSwitchedOff;
+          this.emit(isSwitchedOff ? 'switchedOff' : 'switchedOn', this);
+        }
+      }
+    }, {
+      key: 'attach',
+      value: function attach(el) {
+        var result = _get(RemoteMediaTrack.prototype.__proto__ || Object.getPrototypeOf(RemoteMediaTrack.prototype), 'attach', this).call(this, el);
+        if (this.mediaStreamTrack.enabled !== true) {
+          // NOTE(mpatwardhan): we disable mediaStreamTrack when there
+          // are no attchments to it (see notes below). Now that there
+          // are attachments reenable the track.
+          this.mediaStreamTrack.enabled = true;
+        }
+        return result;
+      }
+    }, {
+      key: 'detach',
+      value: function detach(el) {
+        var result = _get(RemoteMediaTrack.prototype.__proto__ || Object.getPrototypeOf(RemoteMediaTrack.prototype), 'detach', this).call(this, el);
+        if (this._attachments.size === 0) {
+          // NOTE(mpatwardhan): chrome continues playing webrtc audio
+          // track even after audio element is removed from the DOM.
+          // https://bugs.chromium.org/p/chromium/issues/detail?id=749928
+          // to workaround: here disable the track when
+          // there are no elements attached to it.
+          this.mediaStreamTrack.enabled = false;
+        }
+        return result;
       }
     }]);
 
@@ -7571,8 +8883,22 @@ function mixinRemoteMediaTrack(AudioOrVideoTrack) {
  * @event RemoteMediaTrack#enabled
  */
 
+/**
+ * A {@link RemoteMediaTrack} was switched off.
+ * @param {RemoteMediaTrack} track - The {@link RemoteMediaTrack} that was
+ *   switched off
+ * @event RemoteMediaTrack#switchedOff
+ */
+
+/**
+ * A {@link RemoteMediaTrack} was switched on.
+ * @param {RemoteMediaTrack} track - The {@link RemoteMediaTrack} that was
+ *   switched on
+ * @event RemoteMediaTrack#switchedOn
+ */
+
 module.exports = mixinRemoteMediaTrack;
-},{}],57:[function(require,module,exports){
+},{"../../util/constants":142}],67:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -7588,18 +8914,25 @@ var TrackPublication = require('./trackpublication');
 /**
  * A {@link RemoteTrackPublication} represents a {@link RemoteTrack} that has
  * been published to a {@link Room}.
+ * @extends TrackPublication
  * @property {boolean} isSubscribed - whether the published {@link RemoteTrack}
  *   is subscribed to
  * @property {boolean} isTrackEnabled - whether the published
  *   {@link RemoteTrack} is enabled
  * @property {Track.Kind} kind - kind of the published {@link RemoteTrack}
+ * @property {Track.Priority} publishPriority - the {@link Track.Priority} of the published
+ *   {@link RemoteTrack} set by the {@link RemoteParticipant}
  * @property {?RemoteTrack} track - Unless you have subscribed to the
  *   {@link RemoteTrack}, this property is null
+ * @emits RemoteTrackPublication#publishPriorityChanged
  * @emits RemoteTrackPublication#subscribed
  * @emits RemoteTrackPublication#subscriptionFailed
  * @emits RemoteTrackPublication#trackDisabled
  * @emits RemoteTrackPublication#trackEnabled
+ * @emits RemoteTrackPublication#trackSwitchedOff
+ * @emits RemoteTrackPublication#trackSwitchedOn
  * @emits RemoteTrackPublication#unsubscribed
+ *
  */
 
 var RemoteTrackPublication = function (_TrackPublication) {
@@ -7633,12 +8966,18 @@ var RemoteTrackPublication = function (_TrackPublication) {
       isTrackEnabled: {
         enumerable: true,
         get: function get() {
-          return this._signaling.isEnabled;
+          return signaling.isEnabled;
         }
       },
       kind: {
         enumerable: true,
         value: signaling.kind
+      },
+      publishPriority: {
+        enumerable: true,
+        get: function get() {
+          return signaling.priority;
+        }
       },
       track: {
         enumerable: true,
@@ -7648,15 +8987,37 @@ var RemoteTrackPublication = function (_TrackPublication) {
       }
     });
 
+    // remember original state, and fire events only on change.
+    var error = signaling.error,
+        isEnabled = signaling.isEnabled,
+        isSwitchedOff = signaling.isSwitchedOff,
+        priority = signaling.priority;
+
+
     signaling.on('updated', function () {
-      if (signaling.error) {
+      if (error !== signaling.error) {
+        error = signaling.error;
         _this.emit('subscriptionFailed', signaling.error);
         return;
       }
-      if (_this.track) {
-        _this.track._setEnabled(signaling.isEnabled);
+      if (isEnabled !== signaling.isEnabled) {
+        isEnabled = signaling.isEnabled;
+        if (_this.track) {
+          _this.track._setEnabled(signaling.isEnabled);
+        }
+        _this.emit(signaling.isEnabled ? 'trackEnabled' : 'trackDisabled');
       }
-      _this.emit(signaling.isEnabled ? 'trackEnabled' : 'trackDisabled');
+      if (isSwitchedOff !== signaling.isSwitchedOff) {
+        isSwitchedOff = signaling.isSwitchedOff;
+        if (_this.track) {
+          _this.track._setSwitchedOff(signaling.isSwitchedOff);
+          _this.emit(signaling.isSwitchedOff ? 'trackSwitchedOff' : 'trackSwitchedOn', _this.track);
+        }
+      }
+      if (priority !== signaling.priority) {
+        priority = signaling.priority;
+        _this.emit('publishPriorityChanged', priority);
+      }
     });
     return _this;
   }
@@ -7700,6 +9061,15 @@ var RemoteTrackPublication = function (_TrackPublication) {
 }(TrackPublication);
 
 /**
+ * The {@link RemoteTrack}'s publish {@link Track.Priority} was changed by the
+ * {@link RemoteParticipant}.
+ * @param {Track.Priority} priority - the {@link RemoteTrack}'s new publish
+ *   {@link Track.Priority}; RemoteTrackPublication#publishPriority is also
+ *   updated accordingly
+ * @event RemoteTrackPublication#publishPriorityChanged
+ */
+
+/**
  * Your {@link LocalParticipant} subscribed to the {@link RemoteTrack}.
  * @param {RemoteTrack} track - the {@link RemoteTrack} that was subscribed to
  * @event RemoteTrackPublication#subscribed
@@ -7723,6 +9093,18 @@ var RemoteTrackPublication = function (_TrackPublication) {
  */
 
 /**
+ * The {@link RemoteTrack} was switched off.
+ * @param {RemoteTrack} track - the {@link RemoteTrack} that was switched off
+ * @event RemoteTrackPublication#trackSwitchedOff
+ */
+
+/**
+ * The {@link RemoteTrack} was switched on.
+ * @param {RemoteTrack} track - the {@link RemoteTrack} that was switched on
+ * @event RemoteTrackPublication#trackSwitchedOn
+ */
+
+/**
  * Your {@link LocalParticipant} unsubscribed from the {@link RemoteTrack}.
  * @param {RemoteTrack} track - the {@link RemoteTrack} that was unsubscribed from
  * @event RemoteTrackPublication#unsubscribed
@@ -7735,10 +9117,12 @@ var RemoteTrackPublication = function (_TrackPublication) {
  */
 
 module.exports = RemoteTrackPublication;
-},{"./trackpublication":61}],58:[function(require,module,exports){
+},{"./trackpublication":71}],68:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
+
+var _get = function get(object, property, receiver) { if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { return get(parent, property, receiver); } } else if ("value" in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } };
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
@@ -7755,11 +9139,16 @@ var RemoteMediaVideoTrack = mixinRemoteMediaTrack(VideoTrack);
  * A {@link RemoteVideoTrack} represents a {@link VideoTrack} published to a
  * {@link Room} by a {@link RemoteParticipant}.
  * @extends VideoTrack
+ * @property {boolean} isEnabled - Whether the {@link RemoteVideoTrack} is enabled
+ * @property {boolean} isSwitchedOff - Whether the {@link RemoteVideoTrack} is switched off
  * @property {Track.SID} sid - The {@link RemoteVideoTrack}'s SID
+ * @property {?Track.Priority} priority - The subscribe priority of the {@link RemoteVideoTrack}
  * @emits RemoteVideoTrack#dimensionsChanged
  * @emits RemoteVideoTrack#disabled
  * @emits RemoteVideoTrack#enabled
  * @emits RemoteVideoTrack#started
+ * @emits RemoteVideoTrack#switchedOff
+ * @emits RemoteVideoTrack#switchedOn
  */
 
 var RemoteVideoTrack = function (_RemoteMediaVideoTrac) {
@@ -7769,19 +9158,36 @@ var RemoteVideoTrack = function (_RemoteMediaVideoTrac) {
    * Construct a {@link RemoteVideoTrack}.
    * @param {Track.SID} sid - The {@link RemoteVideoTrack}'s SID
    * @param {MediaTrackReceiver} mediaTrackReceiver - A video MediaStreamTrack container
-   * @param {boolean} isEnabled - whether the {@link RemoteAudioTrack} is enabled
+   * @param {boolean} isEnabled - whether the {@link RemoteVideoTrack} is enabled
+   * @param {function(?Track.Priority): void} setPriority - Set or clear the subscribe
+   *  {@link Track.Priority} of the {@link RemoteVideoTrack}
    * @param {{log: Log}} options - The {@link RemoteTrack} options
    */
-  function RemoteVideoTrack(sid, mediaTrackReceiver, isEnabled, options) {
+  function RemoteVideoTrack(sid, mediaTrackReceiver, isEnabled, setPriority, options) {
     _classCallCheck(this, RemoteVideoTrack);
 
-    return _possibleConstructorReturn(this, (RemoteVideoTrack.__proto__ || Object.getPrototypeOf(RemoteVideoTrack)).call(this, sid, mediaTrackReceiver, isEnabled, options));
+    return _possibleConstructorReturn(this, (RemoteVideoTrack.__proto__ || Object.getPrototypeOf(RemoteVideoTrack)).call(this, sid, mediaTrackReceiver, isEnabled, setPriority, options));
   }
 
   _createClass(RemoteVideoTrack, [{
     key: 'toString',
     value: function toString() {
       return '[RemoteVideoTrack #' + this._instanceId + ': ' + this.sid + ']';
+    }
+
+    /**
+     * Update the subscribe {@link Track.Priority} of the {@link RemoteVideoTrack}.
+     * @param {?Track.Priority} priority - the new subscribe {@link Track.Priority};
+     *   If <code>null</code>, then the subscribe {@link Track.Priority} is cleared, which
+     *   means the {@link Track.Priority} set by the publisher is now the effective priority.
+     * @returns {this}
+     * @throws {RangeError}
+     */
+
+  }, {
+    key: 'setPriority',
+    value: function setPriority(priority) {
+      return _get(RemoteVideoTrack.prototype.__proto__ || Object.getPrototypeOf(RemoteVideoTrack.prototype), 'setPriority', this).call(this, priority);
     }
   }]);
 
@@ -7803,14 +9209,35 @@ var RemoteVideoTrack = function (_RemoteMediaVideoTrac) {
  */
 
 /**
- * The {@link RemoteVideoTrack} was enabled, i.e. "unpaused".
+ * The {@link RemoteVideoTrack} was enabled, i.e. "resumed".
  * @param {RemoteVideoTrack} track - The {@link RemoteVideoTrack} that was
  *   enabled
  * @event RemoteVideoTrack#enabled
  */
 
+/**
+ * The {@link RemoteVideoTrack} started. This means there is enough video data
+ * to begin playback.
+ * @param {RemoteVideoTrack} track - The {@link RemoteVideoTrack} that started
+ * @event RemoteVideoTrack#started
+ */
+
+/**
+ * A {@link RemoteVideoTrack} was switched off.
+ * @param {RemoteVideoTrack} track - The {@link RemoteVideoTrack} that was
+ *   switched off
+ * @event RemoteVideoTrack#switchedOff
+ */
+
+/**
+ * A {@link RemoteVideoTrack} was switched on.
+ * @param {RemoteVideoTrack} track - The {@link RemoteVideoTrack} that was
+ *   switched on
+ * @event RemoteVideoTrack#switchedOn
+ */
+
 module.exports = RemoteVideoTrack;
-},{"./remotemediatrack":56,"./videotrack":63}],59:[function(require,module,exports){
+},{"./remotemediatrack":66,"./videotrack":73}],69:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -7891,7 +9318,7 @@ var RemoteVideoTrackPublication = function (_RemoteTrackPublicati) {
  */
 
 module.exports = RemoteVideoTrackPublication;
-},{"./remotetrackpublication":57}],60:[function(require,module,exports){
+},{"./remotetrackpublication":67}],70:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -7973,7 +9400,7 @@ var MediaTrackSender = function (_MediaTrackTransceive) {
 }(MediaTrackTransceiver);
 
 module.exports = MediaTrackSender;
-},{"./transceiver":62}],61:[function(require,module,exports){
+},{"./transceiver":72}],71:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -8091,7 +9518,7 @@ var TrackPublication = function (_EventEmitter) {
  */
 
 module.exports = TrackPublication;
-},{"../../eventemitter":32,"../../util":132,"../../util/constants":130,"../../util/log":135}],62:[function(require,module,exports){
+},{"../../eventemitter":41,"../../util":144,"../../util/constants":142,"../../util/log":147}],72:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -8153,7 +9580,7 @@ var MediaTrackTransceiver = function (_TrackTransceiver) {
 }(TrackTransceiver);
 
 module.exports = MediaTrackTransceiver;
-},{"../../transceiver":126}],63:[function(require,module,exports){
+},{"../../transceiver":138}],73:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -8402,7 +9829,7 @@ function dimensionsChanged(track, elem) {
  */
 
 module.exports = VideoTrack;
-},{"./mediatrack":50}],64:[function(require,module,exports){
+},{"./mediatrack":60}],74:[function(require,module,exports){
 'use strict';
 
 var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }();
@@ -8499,7 +9926,7 @@ var NetworkQualityConfigurationImpl = function (_EventEmitter) {
 }(EventEmitter);
 
 module.exports = NetworkQualityConfigurationImpl;
-},{"./util":132,"./util/constants":130,"events":155}],65:[function(require,module,exports){
+},{"./util":144,"./util/constants":142,"events":168}],75:[function(require,module,exports){
 'use strict';
 
 var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }();
@@ -8543,13 +9970,15 @@ var nInstances = 0;
  * @property {?NetworkQualityStats} networkQualityStats - The
  *    {@link Participant}'s current {@link NetworkQualityStats}, if any
  * @property {Participant.SID} sid - The {@link Participant}'s SID
- * @property {string} state - "connected", "disconnected" or "failed"
+ * @property {string} state - "connected", "disconnected" or "reconnecting"
  * @property {Map<Track.SID, TrackPublication>} tracks -
  *    The {@link Participant}'s {@link TrackPublication}s
  * @property {Map<Track.SID, VideoTrackPublication>} videoTracks -
  *    The {@link Participant}'s {@link VideoTrackPublication}s
  * @emits Participant#disconnected
- * @emits Particiapnt#networkQualityLevelChanged
+ * @emits Participant#networkQualityLevelChanged
+ * @emits Participant#reconnected
+ * @emits Participant#reconnecting
  * @emits Participant#trackDimensionsChanged
  * @emits Participant#trackStarted
  */
@@ -8796,7 +10225,7 @@ var Participant = function (_EventEmitter) {
       var RemoteVideoTrackPublication = this._RemoteVideoTrackPublication;
       var RemoteDataTrack = this._RemoteDataTrack;
       var RemoteDataTrackPublication = this._RemoteDataTrackPublication;
-      var signaling = this._signaling;
+      var participantSignaling = this._signaling;
 
       function trackSignalingAdded(signaling) {
         var RemoteTrackPublication = {
@@ -8863,7 +10292,11 @@ var Participant = function (_EventEmitter) {
           return;
         }
 
-        var track = kind === 'data' ? new RemoteTrack(sid, trackTransceiver, { log: log, name: name }) : new RemoteTrack(sid, trackTransceiver, isEnabled, { log: log, name: name });
+        var options = { log: log, name: name };
+        var setPriority = function setPriority(newPriority) {
+          return participantSignaling.updateSubscriberTrackPriority(sid, newPriority);
+        };
+        var track = kind === 'data' ? new RemoteTrack(sid, trackTransceiver, options) : new RemoteTrack(sid, trackTransceiver, isEnabled, setPriority, options);
 
         self._addTrack(track, publication, trackTransceiver.id);
       }
@@ -8885,17 +10318,28 @@ var Participant = function (_EventEmitter) {
         }
       }
 
-      signaling.on('trackAdded', trackSignalingAdded);
-      signaling.on('trackRemoved', trackSignalingRemoved);
+      participantSignaling.on('trackAdded', trackSignalingAdded);
+      participantSignaling.on('trackRemoved', trackSignalingRemoved);
 
-      signaling.tracks.forEach(trackSignalingAdded);
+      participantSignaling.tracks.forEach(trackSignalingAdded);
 
-      signaling.on('stateChanged', function stateChanged(state) {
+      participantSignaling.on('stateChanged', function stateChanged(state) {
         if (state === 'disconnected') {
           log.debug('Removing event listeners');
-          signaling.removeListener('stateChanged', stateChanged);
-          signaling.removeListener('trackAdded', trackSignalingAdded);
-          signaling.removeListener('trackRemoved', trackSignalingRemoved);
+          participantSignaling.removeListener('stateChanged', stateChanged);
+          participantSignaling.removeListener('trackAdded', trackSignalingAdded);
+          participantSignaling.removeListener('trackRemoved', trackSignalingRemoved);
+        } else if (state === 'connected') {
+          // NOTE(mmalavalli): Any transition to "connected" here is a result of
+          // successful signaling reconnection, and not a first-time establishment
+          // of the signaling connection.
+          log.info('reconnected');
+
+          // NOTE(mpatwardhan): `stateChanged` can get emitted with StateMachine locked.
+          // Do not signal  public events synchronously with lock held.
+          setTimeout(function () {
+            return self.emit('reconnected');
+          }, 0);
         }
       });
     }
@@ -9001,6 +10445,16 @@ var Participant = function (_EventEmitter) {
  * @param {?NetworkQualityStats} networkQualityStats - The {@link NetworkQualityStats}
  *   based on which {@link NetworkQualityLevel} is calculated, if any
  * @event Participant#networkQualityLevelChanged
+ */
+
+/**
+ * The {@link Participant} has reconnected to the {@link Room} after a signaling connection disruption.
+ * @event Participant#reconnected
+ */
+
+/**
+ * The {@link Participant} is reconnecting to the {@link Room} after a signaling connection disruption.
+ * @event Participant#reconnecting
  */
 
 /**
@@ -9161,7 +10615,7 @@ function reemitTrackPublicationEvents(participant, publication) {
 }
 
 module.exports = Participant;
-},{"./eventemitter":32,"./media/track/remoteaudiotrack":52,"./media/track/remoteaudiotrackpublication":53,"./media/track/remotedatatrack":54,"./media/track/remotedatatrackpublication":55,"./media/track/remotevideotrack":58,"./media/track/remotevideotrackpublication":59,"./util":132}],66:[function(require,module,exports){
+},{"./eventemitter":41,"./media/track/remoteaudiotrack":62,"./media/track/remoteaudiotrackpublication":63,"./media/track/remotedatatrack":64,"./media/track/remotedatatrackpublication":65,"./media/track/remotevideotrack":68,"./media/track/remotevideotrackpublication":69,"./util":144}],76:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -9257,7 +10711,7 @@ var QueueingEventEmitter = function (_EventEmitter) {
 }(EventEmitter);
 
 module.exports = QueueingEventEmitter;
-},{"events":155}],67:[function(require,module,exports){
+},{"events":168}],77:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -9286,14 +10740,19 @@ var Participant = require('./participant');
  *    The {@link Participant}'s {@link RemoteTrackPublication}s
  * @property {Map<Track.SID, RemoteVideoTrackPublication>} videoTracks -
  *    The {@link Participant}'s {@link RemoteVideoTrackPublication}s
+ * @emits RemoteParticipant#reconnected
+ * @emits RemoteParticipant#reconnecting
  * @emits RemoteParticipant#trackDimensionsChanged
  * @emits RemoteParticipant#trackDisabled
  * @emits RemoteParticipant#trackEnabled
  * @emits RemoteParticipant#trackMessage
  * @emits RemoteParticipant#trackPublished
+ * @emits RemoteParticipant#trackPublishPriorityChanged
  * @emits RemoteParticipant#trackStarted
  * @emits RemoteParticipant#trackSubscribed
  * @emits RemoteParticipant#trackSubscriptionFailed
+ * @emits RemoteParticipant#trackSwitchedOff
+ * @emits RemoteParticipant#trackSwitchedOn
  * @emits RemoteParticipant#trackUnpublished
  * @emits RemoteParticipant#trackUnsubscribed
  */
@@ -9364,7 +10823,7 @@ var RemoteParticipant = function (_Participant) {
   }, {
     key: '_getTrackPublicationEvents',
     value: function _getTrackPublicationEvents() {
-      return [].concat(_toConsumableArray(_get(RemoteParticipant.prototype.__proto__ || Object.getPrototypeOf(RemoteParticipant.prototype), '_getTrackPublicationEvents', this).call(this)), [['subscriptionFailed', 'trackSubscriptionFailed'], ['trackDisabled', 'trackDisabled'], ['trackEnabled', 'trackEnabled']]);
+      return [].concat(_toConsumableArray(_get(RemoteParticipant.prototype.__proto__ || Object.getPrototypeOf(RemoteParticipant.prototype), '_getTrackPublicationEvents', this).call(this)), [['subscriptionFailed', 'trackSubscriptionFailed'], ['trackDisabled', 'trackDisabled'], ['trackEnabled', 'trackEnabled'], ['publishPriorityChanged', 'trackPublishPriorityChanged'], ['trackSwitchedOff', 'trackSwitchedOff'], ['trackSwitchedOn', 'trackSwitchedOn']]);
     }
 
     /**
@@ -9429,6 +10888,16 @@ var RemoteParticipant = function (_Participant) {
 }(Participant);
 
 /**
+ * The {@link RemoteParticipant} has reconnected to the {@link Room} after a signaling connection disruption.
+ * @event RemoteParticipant#reconnected
+ */
+
+/**
+ * The {@link RemoteParticipant} is reconnecting to the {@link Room} after a signaling connection disruption.
+ * @event RemoteParticipant#reconnecting
+ */
+
+/**
  * One of the {@link RemoteParticipant}'s {@link RemoteVideoTrack}'s dimensions changed.
  * @param {RemoteVideoTrack} track - The {@link RemoteVideoTrack} whose dimensions changed
  * @event RemoteParticipant#trackDimensionsChanged
@@ -9436,13 +10905,13 @@ var RemoteParticipant = function (_Participant) {
 
 /**
  * A {@link RemoteTrack} was disabled by the {@link RemoteParticipant}.
- * @param {RemoteTrack} track - The {@link RemoteTrack} that was disabled
+ * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication} associated with the disabled {@link RemoteTrack}
  * @event RemoteParticipant#trackDisabled
  */
 
 /**
  * A {@link RemoteTrack} was enabled by the {@link RemoteParticipant}.
- * @param {RemoteTrack} track - The {@link RemoteTrack} that was enabled
+ * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication} associated with the enabled {@link RemoteTrack}
  * @event RemoteParticipant#trackEnabled
  */
 
@@ -9502,6 +10971,32 @@ var RemoteParticipant = function (_Participant) {
  */
 
 /**
+ * The {@link RemoteTrackPublication}'s publish {@link Track.Priority} was changed by the
+ * {@link RemoteParticipant}.
+ * @param {Track.Priority} priority - the {@link RemoteTrack}'s new publish
+ *   {@link Track.Priority};
+ * @param {RemoteTrackPublication} publication - The
+ *   {@link RemoteTrackPublication} for the {@link RemoteTrack} that changed priority
+ * @event RemoteParticipant#trackPublishPriorityChanged
+ */
+
+/**
+ * A {@link RemoteParticipant}'s {@link RemoteTrack} was subscribed to.
+ * @param {RemoteTrack} track - The {@link RemoteTrack} that was switched off
+ * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication}
+ *   for the {@link RemoteTrack} that was switched off
+ * @event RemoteParticipant#trackSwitchedOff
+ */
+
+/**
+ * A {@link RemoteParticipant}'s {@link RemoteTrack} was switched on.
+ * @param {RemoteTrack} track - The {@link RemoteTrack} that was switched on.
+ * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication}
+ *   for the {@link RemoteTrack} that was switched on
+ * @event RemoteParticipant#trackSwitchedOn
+ */
+
+/**
  * A {@link RemoteTrack} was unpublished by the {@link RemoteParticipant}.
  * @event RemoteParticipant#trackUnpublished
  * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication}
@@ -9517,7 +11012,7 @@ var RemoteParticipant = function (_Participant) {
  */
 
 module.exports = RemoteParticipant;
-},{"./participant":65}],68:[function(require,module,exports){
+},{"./participant":75}],78:[function(require,module,exports){
 'use strict';
 
 var XHR = require('xmlhttprequest').XMLHttpRequest;
@@ -9570,7 +11065,7 @@ request.get = request.bind(null, 'GET');
 request.post = request.bind(null, 'POST');
 
 module.exports = request;
-},{"xmlhttprequest":152}],69:[function(require,module,exports){
+},{"xmlhttprequest":165}],79:[function(require,module,exports){
 'use strict';
 
 var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }();
@@ -9607,6 +11102,8 @@ var nInstances = 0;
  *   recorded
  * @property {LocalParticipant} localParticipant - Your {@link LocalParticipant}
  *   in the {@link Room}
+ * @property {string} mediaRegion - String indicating geographical region
+ *    where  media is processed for the {@link Room}.
  * @property {string} name - The {@link Room}'s name
  * @property {Map<Participant.SID, RemoteParticipant>} participants -
  *   The {@link RemoteParticipant}s participating in this {@link Room}
@@ -9616,6 +11113,8 @@ var nInstances = 0;
  * @emits Room#disconnected
  * @emits Room#participantConnected
  * @emits Room#participantDisconnected
+ * @emits Room#participantReconnected
+ * @emits Room#participantReconnecting
  * @emits Room#reconnected
  * @emits Room#reconnecting
  * @emits Room#recordingStarted
@@ -9625,8 +11124,11 @@ var nInstances = 0;
  * @emits Room#trackEnabled
  * @emits Room#trackMessage
  * @emits Room#trackPublished
+ * @emits Room#trackPublishPriorityChanged
  * @emits Room#trackStarted
  * @emits Room#trackSubscribed
+ * @emits Room#trackSwitchedOff
+ * @emits Room#trackSwitchedOn
  * @emits Room#trackUnpublished
  * @emits Room#trackUnsubscribed
  */
@@ -9697,6 +11199,10 @@ var Room = function (_EventEmitter) {
         get: function get() {
           return signaling.state;
         }
+      },
+      mediaRegion: {
+        enumerable: true,
+        value: signaling.mediaRegion
       }
     });
 
@@ -9833,6 +11339,26 @@ function rewriteLocalTrackIds(room, trackStats) {
  */
 
 /**
+ * A {@link RemoteParticipant} has reconnected to the {@link Room} after a signaling connection disruption.
+ * @param {RemoteParticipant} participant - The {@link RemoteParticipant} that has reconnected.
+ * @event Room#participantReconnected
+ * @example
+ * myRoom.on('participantReconnected', participant => {
+ *   console.log(participant.identity + ' reconnected to the Room');
+ * });
+ */
+
+/**
+ * A {@link RemoteParticipant} is reconnecting to the {@link Room} after a signaling connection disruption.
+ * @param {RemoteParticipant} participant - The {@link RemoteParticipant} that is reconnecting.
+ * @event Room#participantReconnecting
+ * @example
+ * myRoom.on('participantReconnecting', participant => {
+ *   console.log(participant.identity + ' is reconnecting to the Room');
+ * });
+ */
+
+/**
  * Your application successfully reconnected to the {@link Room}. When this
  * event is emitted, the {@link Room} is in state "connected".
  * @event Room#reconnected
@@ -9882,7 +11408,7 @@ function rewriteLocalTrackIds(room, trackStats) {
 
 /**
  * A {@link RemoteTrack} was disabled by a {@link RemoteParticipant} in the {@link Room}.
- * @param {RemoteTrack} track - The {@link RemoteTrack} that was disabled
+ * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication} that represents disabled {@link RemoteTrack}
  * @param {RemoteParticipant} participant - The {@link RemoteParticipant} who
  *   disabled the {@link RemoteTrack}
  * @event Room#trackDisabled
@@ -9890,7 +11416,7 @@ function rewriteLocalTrackIds(room, trackStats) {
 
 /**
  * A {@link RemoteTrack} was enabled by a {@link RemoteParticipant} in the {@link Room}.
- * @param {RemoteTrack} track - The {@link RemoteTrack} that was enabled
+ * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication} that represents enabled {@link RemoteTrack}
  * @param {RemoteParticipant} participant - The {@link RemoteParticipant} who
  *   enabled the {@link RemoteTrack}
  * @event Room#trackEnabled
@@ -9942,14 +11468,36 @@ function rewriteLocalTrackIds(room, trackStats) {
 /**
  * A {@link RemoteParticipant}'s {@link RemoteTrack} was subscribed to.
  * @param {RemoteTrack} track - The {@link RemoteTrack} that was subscribed
+ * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication}
+ *   for the {@link RemoteTrack} that was subscribed to
  * @param {RemoteParticipant} participant - The {@link RemoteParticipant} whose
  *   {@link RemoteTrack} was subscribed
  * @event Room#trackSubscribed
  * @example
- * room.on('trackSubscribed', function(track, participant) {
+ * room.on('trackSubscribed', function(track, publication, participant) {
  *   var participantView = document.getElementById('participant-view-' + participant.identity);
  *   participantView.appendChild(track.attach());
  * });
+ */
+
+/**
+ * A {@link RemoteParticipant}'s {@link RemoteTrack} was switched off.
+ * @param {RemoteTrack} track - The {@link RemoteTrack} that was switched off
+ * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication}
+ *   for the {@link RemoteTrack} that was subscribed to
+ * @param {RemoteParticipant} participant - The {@link RemoteParticipant} whose
+ *   {@link RemoteTrack} was switched off
+ * @event Room#trackSwitchedOff
+ */
+
+/**
+ * A {@link RemoteParticipant}'s {@link RemoteTrack} was switched on.
+ * @param {RemoteTrack} track - The {@link RemoteTrack} that was switched on
+ * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication}
+ *   for the {@link RemoteTrack} that was subscribed to
+ * @param {RemoteParticipant} participant - The {@link RemoteParticipant} whose
+ *   {@link RemoteTrack} was switched on
+ * @event Room#trackSwitchedOn
  */
 
 /**
@@ -9965,6 +11513,18 @@ function rewriteLocalTrackIds(room, trackStats) {
  */
 
 /**
+ * The {@link RemoteTrack}'s publish {@link Track.Priority} was changed by the
+ * {@link RemoteParticipant}.
+ * @param {Track.Priority} priority - the {@link RemoteTrack}'s new publish
+ *   {@link Track.Priority};
+ * @param {RemoteTrackPublication} publication - The
+ *   {@link RemoteTrackPublication} for the {@link RemoteTrack} that changed priority
+ * @param {RemoteParticipant} participant - The {@link RemoteParticipant} whose
+ *   {@link RemoteTrack} changed priority
+ * @event Room#trackPublishPriorityChanged
+ */
+
+/**
  * A {@link RemoteTrack} was unpublished by a {@link RemoteParticipant} to the {@link Room}.
  * @event Room#trackUnpublished
  * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication}
@@ -9976,11 +11536,13 @@ function rewriteLocalTrackIds(room, trackStats) {
 /**
  * A {@link RemoteParticipant}'s {@link RemoteTrack} was unsubscribed from.
  * @param {RemoteTrack} track - The {@link RemoteTrack} that was unsubscribed
+ * @param {RemoteTrackPublication} publication - The {@link RemoteTrackPublication}
+ *   for the {@link RemoteTrack} that was unsubscribed from
  * @param {RemoteParticipant} participant - The {@link RemoteParticipant} whose
  *   {@link RemoteTrack} was unsubscribed
  * @event Room#trackUnsubscribed
  * @example
- * room.on('trackUnsubscribed', function(track, participant) {
+ * room.on('trackUnsubscribed', function(track, publication, participant) {
  *   track.detach().forEach(function(mediaElement) {
  *     mediaElement.remove();
  *   });
@@ -9995,11 +11557,16 @@ function connectParticipant(room, participantSignaling) {
   room._participants.set(participant.sid, participant);
   room.emit('participantConnected', participant);
 
-  // Reemit Track events from the RemoteParticipant.
-  var eventListeners = ['trackDimensionsChanged', 'trackDisabled', 'trackEnabled', 'trackMessage', 'trackPublished', 'trackStarted', 'trackSubscribed', 'trackSubscriptionFailed', 'trackUnpublished', 'trackUnsubscribed'].map(function (event) {
+  // Reemit Track and RemoteParticipant events.
+  var eventListeners = [['reconnected', 'participantReconnected'], ['reconnecting', 'participantReconnecting'], 'trackDimensionsChanged', 'trackDisabled', 'trackEnabled', 'trackMessage', 'trackPublished', 'trackPublishPriorityChanged', 'trackStarted', 'trackSubscribed', 'trackSubscriptionFailed', 'trackSwitchedOff', 'trackSwitchedOn', 'trackUnpublished', 'trackUnsubscribed'].map(function (eventOrPair) {
+    var _ref3 = Array.isArray(eventOrPair) ? eventOrPair : [eventOrPair, eventOrPair],
+        _ref4 = _slicedToArray(_ref3, 2),
+        event = _ref4[0],
+        participantEvent = _ref4[1];
+
     function reemit() {
       var args = [].slice.call(arguments);
-      args.unshift(event);
+      args.unshift(participantEvent);
       args.push(participant);
       room.emit.apply(room, _toConsumableArray(args));
     }
@@ -10007,7 +11574,6 @@ function connectParticipant(room, participantSignaling) {
     return [event, reemit];
   });
 
-  // Reemit state transition events from the RemoteParticipant.
   participant.once('disconnected', function participantDisconnected() {
     var dominantSpeaker = room.dominantSpeaker;
     log.info('RemoteParticipant disconnected:', participant);
@@ -10055,16 +11621,27 @@ function handleSignalingEvents(room, signaling) {
         signaling.removeListener('stateChanged', stateChanged);
         break;
       case 'reconnecting':
-        room.emit('reconnecting', error);
+
+        // NOTE(mpatwardhan): `stateChanged` can get emitted with StateMachine locked.
+        // Do not signal  public events synchronously with lock held.
+        setTimeout(function () {
+          return room.emit('reconnecting', error);
+        }, 0);
+
         break;
       default:
-        room.emit('reconnected');
+
+        // NOTE(mpatwardhan): `stateChanged` can get emitted with StateMachine locked.
+        // Do not signal  public events synchronously with lock held.
+        setTimeout(function () {
+          return room.emit('reconnected');
+        }, 0);
     }
   });
 }
 
 module.exports = Room;
-},{"./eventemitter":32,"./remoteparticipant":67,"./stats/statsreport":123,"./util":132}],70:[function(require,module,exports){
+},{"./eventemitter":41,"./remoteparticipant":77,"./stats/statsreport":135,"./util":144}],80:[function(require,module,exports){
 /* eslint consistent-return:0 */
 'use strict';
 
@@ -10258,7 +11835,7 @@ var Signaling = function (_StateMachine) {
 }(StateMachine);
 
 module.exports = Signaling;
-},{"../statemachine":95,"./participant":73,"./room":77}],71:[function(require,module,exports){
+},{"../statemachine":107,"./participant":83,"./room":87}],81:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -10294,14 +11871,16 @@ var LocalParticipantSignaling = function (_ParticipantSignaling) {
 
   /**
    * @param {DataTrackSender|MediaTrackSender} trackSender
+   * @param {string} name
+   * @param {Track.Priority} priority
    * @returns {LocalTrackPublicationSignaling} publication
    */
 
 
   _createClass(LocalParticipantSignaling, [{
     key: 'addTrack',
-    value: function addTrack(trackSender, name) {
-      var publication = this._createLocalTrackPublicationSignaling(trackSender, name);
+    value: function addTrack(trackSender, name, priority) {
+      var publication = this._createLocalTrackPublicationSignaling(trackSender, name, priority);
       this._trackSendersToPublications.set(trackSender, publication);
       this._publicationsToTrackSenders.set(publication, trackSender);
       _get(LocalParticipantSignaling.prototype.__proto__ || Object.getPrototypeOf(LocalParticipantSignaling.prototype), 'addTrack', this).call(this, publication);
@@ -10320,7 +11899,7 @@ var LocalParticipantSignaling = function (_ParticipantSignaling) {
     }
 
     /**
-     * @param {LocalTrackPublicationSignaling} publication
+     * @param {LocalTrackPublicationSignaling} trackPublication
      * @returns {?DataTrackSender|MediaTrackSender}
      */
 
@@ -10356,7 +11935,7 @@ var LocalParticipantSignaling = function (_ParticipantSignaling) {
 }(ParticipantSignaling);
 
 module.exports = LocalParticipantSignaling;
-},{"./participant":73}],72:[function(require,module,exports){
+},{"./participant":83}],82:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -10374,7 +11953,6 @@ var TrackSignaling = require('./track');
 /**
  * A {@link LocalTrackPublication} implementation
  * @extends TrackSignaling
- * @property {?Error} error - non-null if publication failed
  * @property {Track.ID} id
  */
 
@@ -10384,28 +11962,24 @@ var LocalTrackPublicationSignaling = function (_TrackSignaling) {
   /**
    * Construct a {@link LocalTrackPublicationSignaling}. {@link TrackSenders}
    * are always cloned.
-   * @param {DataTrackSender|MediaTrackSender} trackSender
-   * @param {string} name
+   * @param {DataTrackSender|MediaTrackSender} trackSender - the {@link TrackSender}
+   *   of the {@link LocalTrack} to be published
+   * @param {string} name - the name of the {@link LocalTrack} to be published
+   * @param {Track.Priority} priority - initial {@link Track.Priority}
    */
-  function LocalTrackPublicationSignaling(trackSender, name) {
+  function LocalTrackPublicationSignaling(trackSender, name, priority) {
     _classCallCheck(this, LocalTrackPublicationSignaling);
 
     trackSender = trackSender.clone();
     var enabled = trackSender.kind === 'data' ? true : trackSender.track.enabled;
 
-    var _this = _possibleConstructorReturn(this, (LocalTrackPublicationSignaling.__proto__ || Object.getPrototypeOf(LocalTrackPublicationSignaling)).call(this, name, trackSender.kind, enabled));
+    var _this = _possibleConstructorReturn(this, (LocalTrackPublicationSignaling.__proto__ || Object.getPrototypeOf(LocalTrackPublicationSignaling)).call(this, name, trackSender.kind, enabled, priority));
 
     _this.setTrackTransceiver(trackSender);
     Object.defineProperties(_this, {
-      _error: {
-        value: null,
+      _updatedPriority: {
+        value: priority,
         writable: true
-      },
-      error: {
-        enumerable: true,
-        get: function get() {
-          return this._error;
-        }
       },
       id: {
         enumerable: true,
@@ -10416,16 +11990,22 @@ var LocalTrackPublicationSignaling = function (_TrackSignaling) {
   }
 
   /**
-   * Enable (or disable) the {@link LocalTrackPublicationSignaling} if it is not
-   * already enabled (or disabled). This also updates the cloned
-   * {@link MediaTrackSender}'s MediaStreamTracks `enabled` state.
-   * @param {boolean} [enabled=true]
-   * @return {this}
+   * The updated {@link Track.Priority} of the {@link LocalTrack}.
+   * @property {Track.priority}
    */
 
 
   _createClass(LocalTrackPublicationSignaling, [{
     key: 'enable',
+
+
+    /**
+     * Enable (or disable) the {@link LocalTrackPublicationSignaling} if it is not
+     * already enabled (or disabled). This also updates the cloned
+     * {@link MediaTrackSender}'s MediaStreamTracks `enabled` state.
+     * @param {boolean} [enabled=true]
+     * @return {this}
+     */
     value: function enable(enabled) {
       enabled = typeof enabled === 'boolean' ? enabled : true;
       this.trackTransceiver.track.enabled = enabled;
@@ -10446,6 +12026,29 @@ var LocalTrackPublicationSignaling = function (_TrackSignaling) {
       }
       return this;
     }
+
+    /**
+     * Update the {@link Track.Priority} of the published {@link LocalTrack}.
+     * @param {Track.priority} priority
+     * @returns {this}
+     */
+
+  }, {
+    key: 'setPriority',
+    value: function setPriority(priority) {
+      if (this._updatedPriority !== priority) {
+        this._updatedPriority = priority;
+        this.emit('updated');
+      }
+      return this;
+    }
+
+    /**
+     * Set the published {@link LocalTrack}'s {@link Track.SID}.
+     * @param {Track.SID} sid
+     * @returns {this}
+     */
+
   }, {
     key: 'setSid',
     value: function setSid(sid) {
@@ -10464,6 +12067,11 @@ var LocalTrackPublicationSignaling = function (_TrackSignaling) {
     key: 'stop',
     value: function stop() {
       this.trackTransceiver.stop();
+    }
+  }, {
+    key: 'updatedPriority',
+    get: function get() {
+      return this._updatedPriority;
     }
   }]);
 
@@ -10486,7 +12094,7 @@ function setError(publication, error) {
 }
 
 module.exports = LocalTrackPublicationSignaling;
-},{"./track":78}],73:[function(require,module,exports){
+},{"./track":88}],83:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -10509,12 +12117,18 @@ ParticipantSignaling States
     | connecting |---->| connected |---->| disconnected |
     |            |     |           |     |              |
     +------------+     +-----------+     +--------------+
-
+                           | ^                    ^
+                           | |  +--------------+  |
+                           | |--|              |  |
+                           |--->| reconnecting |--|
+                                |              |
+                                +--------------+
 */
 
 var states = {
   connecting: ['connected'],
-  connected: ['disconnected'],
+  connected: ['disconnected', 'reconnecting'],
+  reconnecting: ['connected', 'disconnected'],
   disconnected: []
 };
 
@@ -10542,6 +12156,9 @@ var ParticipantSignaling = function (_StateMachine) {
     var _this = _possibleConstructorReturn(this, (ParticipantSignaling.__proto__ || Object.getPrototypeOf(ParticipantSignaling)).call(this, 'connecting', states));
 
     Object.defineProperties(_this, {
+      _enqueuedPriorityUpdates: {
+        value: new Map()
+      },
       _identity: {
         writable: true,
         value: null
@@ -10557,6 +12174,10 @@ var ParticipantSignaling = function (_StateMachine) {
       _sid: {
         writable: true,
         value: null
+      },
+      _trackPrioritySignaling: {
+        value: null,
+        writable: true
       },
       identity: {
         enumerable: true,
@@ -10652,6 +12273,45 @@ var ParticipantSignaling = function (_StateMachine) {
     }
 
     /**
+     * updates the subscriber priority for the given track.
+     * @param {Track.SID} trackSid
+     * @param {?Track.Priority} priority
+     * @returns {void}
+     */
+
+  }, {
+    key: 'updateSubscriberTrackPriority',
+    value: function updateSubscriberTrackPriority(trackSid, priority) {
+      // note the most recent priority update for the track.
+      this._enqueuedPriorityUpdates.set(trackSid, priority);
+      if (this._trackPrioritySignaling) {
+        this._trackPrioritySignaling.sendTrackPriorityUpdate(trackSid, 'subscribe', priority);
+      }
+    }
+
+    /**
+     * Set the {@link TrackPrioritySignaling}.
+     * @param {TrackPrioritySignaling} trackPrioritySignaling
+     * @returns {this}
+     */
+
+  }, {
+    key: 'setTrackPrioritySignaling',
+    value: function setTrackPrioritySignaling(trackPrioritySignaling) {
+      var _this2 = this;
+
+      this._trackPrioritySignaling = trackPrioritySignaling;
+      if (trackPrioritySignaling) {
+        this._enqueuedPriorityUpdates.forEach(function (priority, trackSid) {
+          _this2._trackPrioritySignaling.sendTrackPriorityUpdate(trackSid, 'subscribe', priority);
+        });
+        // NOTE(mpatwardhan)- we intentionally do not clear _enqueuedPriorityUpdates,
+        // this cache will be used to re-send the priorities in case of VMS-FailOver.
+      }
+      return this;
+    }
+
+    /**
      * Connect the {@link ParticipantSignaling}.
      * @param {Participant.SID} sid
      * @param {string} identity
@@ -10661,10 +12321,29 @@ var ParticipantSignaling = function (_StateMachine) {
   }, {
     key: 'connect',
     value: function connect(sid, identity) {
-      if (this.state === 'connecting') {
-        this._sid = sid;
-        this._identity = identity;
+      if (this.state === 'connecting' || this.state === 'reconnecting') {
+        if (!this._sid) {
+          this._sid = sid;
+        }
+        if (!this._identity) {
+          this._identity = identity;
+        }
         this.preempt('connected');
+        return true;
+      }
+      return false;
+    }
+
+    /**
+     * Transition to "reconnecting" state.
+     * @returns {boolean}
+     */
+
+  }, {
+    key: 'reconnecting',
+    value: function reconnecting() {
+      if (this.state === 'connecting' || this.state === 'connected') {
+        this.preempt('reconnecting');
         return true;
       }
       return false;
@@ -10707,7 +12386,7 @@ var ParticipantSignaling = function (_StateMachine) {
  */
 
 module.exports = ParticipantSignaling;
-},{"../statemachine":95,"../stats/networkqualitystats":110}],74:[function(require,module,exports){
+},{"../statemachine":107,"../stats/networkqualitystats":122}],84:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -10792,7 +12471,7 @@ var RecordingSignaling = function (_EventEmitter) {
  */
 
 module.exports = RecordingSignaling;
-},{"events":155}],75:[function(require,module,exports){
+},{"events":168}],85:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -10831,7 +12510,7 @@ var RemoteParticipantSignaling = function (_ParticipantSignaling) {
 }(ParticipantSignaling);
 
 module.exports = RemoteParticipantSignaling;
-},{"./participant":73}],76:[function(require,module,exports){
+},{"./participant":83}],86:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -10858,15 +12537,16 @@ var RemoteTrackPublicationSignaling = function (_TrackSignaling) {
    * @param {string} name
    * @param {Track.Kind} kind
    * @param {boolean} isEnabled
+   * @param {Track.Priority} priority
    */
-  function RemoteTrackPublicationSignaling(sid, name, kind, isEnabled) {
+  function RemoteTrackPublicationSignaling(sid, name, kind, isEnabled, priority) {
     _classCallCheck(this, RemoteTrackPublicationSignaling);
 
-    var _this = _possibleConstructorReturn(this, (RemoteTrackPublicationSignaling.__proto__ || Object.getPrototypeOf(RemoteTrackPublicationSignaling)).call(this, name, kind, isEnabled));
+    var _this = _possibleConstructorReturn(this, (RemoteTrackPublicationSignaling.__proto__ || Object.getPrototypeOf(RemoteTrackPublicationSignaling)).call(this, name, kind, isEnabled, priority));
 
     Object.defineProperties(_this, {
-      _error: {
-        value: null,
+      _isSwitchedOff: {
+        value: false,
         writable: true
       }
     });
@@ -10875,8 +12555,8 @@ var RemoteTrackPublicationSignaling = function (_TrackSignaling) {
   }
 
   /**
-   * Non-null if subscription failed.
-   * @property {?Error}
+   * Whether the {@link RemoteTrackPublicationSignaling} is subscribed to.
+   * @property {boolean}
    */
 
 
@@ -10895,21 +12575,53 @@ var RemoteTrackPublicationSignaling = function (_TrackSignaling) {
       }
       return this;
     }
+
+    /**
+     * Update the publish {@link Track.Priority}.
+     * @param {Track.Priority} priority
+     * @returns {this}
+     */
+
   }, {
-    key: 'error',
-    get: function get() {
-      return this._error;
+    key: 'setPriority',
+    value: function setPriority(priority) {
+      if (this._priority !== priority) {
+        this._priority = priority;
+        this.emit('updated');
+      }
+      return this;
     }
 
     /**
-     * Whether the {@link RemoteTrackPublicationSignaling} is subscribed to.
-     * @property {boolean}
+     * Updates track switch on/off state.
+     * @param {boolean} isSwitchedOff
+     * @returns {this}
      */
 
+  }, {
+    key: 'setSwitchedOff',
+    value: function setSwitchedOff(isSwitchedOff) {
+      if (this._isSwitchedOff !== isSwitchedOff) {
+        this._isSwitchedOff = isSwitchedOff;
+        this.emit('updated');
+      }
+      return this;
+    }
   }, {
     key: 'isSubscribed',
     get: function get() {
       return !!this.trackTransceiver;
+    }
+
+    /**
+     * Whether the {@link RemoteTrackPublicationSignaling} is switched off.
+     * @property {boolean}
+     */
+
+  }, {
+    key: 'isSwitchedOff',
+    get: function get() {
+      return this._isSwitchedOff;
     }
   }]);
 
@@ -10917,7 +12629,7 @@ var RemoteTrackPublicationSignaling = function (_TrackSignaling) {
 }(TrackSignaling);
 
 module.exports = RemoteTrackPublicationSignaling;
-},{"./track":78}],77:[function(require,module,exports){
+},{"./track":88}],87:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -10930,9 +12642,11 @@ function _inherits(subClass, superClass) { if (typeof superClass !== "function" 
 
 var DefaultRecordingSignaling = require('./recording');
 var StateMachine = require('../statemachine');
+var DefaultTimeout = require('../util/timeout');
 
 var _require = require('../util/twilio-video-errors'),
     MediaConnectionError = _require.MediaConnectionError,
+    MediaDTLSTransportFailedError = _require.MediaDTLSTransportFailedError,
     SignalingConnectionDisconnectedError = _require.SignalingConnectionDisconnectedError;
 
 /*
@@ -10963,9 +12677,10 @@ var states = {
 /**
  * A {@link Room} implementation
  * @extends StateMachine
+ * @property {RTCPeerConnectionState} connectionState
  * @property {?Participant.SID} dominantSpeakerSid
  * @property {ParticipantSignaling} localParticipant
- * @property {RTCIceConnectionState} mediaConnectionState
+ * @property {RTCIceConnectionState} iceConnectionState
  * @property {string} name
  * @property {Map<string, RemoteParticipantSignaling>} participants
  * @property {RecordingSignaling} recording
@@ -10973,7 +12688,9 @@ var states = {
  * @property {string} state - "connected", "reconnecting", or "disconnected"
  * @property {string} signalingConnectionState - "connected",
  *   "reconnecting", or "disconnected"
- * @emits RoomSignaling#mediaConnectionStateChanged
+ * @emits RoomSignaling#connectionStateChanged
+ * @emits RoomSignaling#dominantSpeakerChanged
+ * @emits RoomSignaling#iceConnectionStateChanged
  * @emits RoomSignaling#signalingConnectionStateChanged
  */
 
@@ -10985,17 +12702,23 @@ var RoomSignaling = function (_StateMachine) {
    * @param {ParticipantSignaling} localParticipant
    * @param {Room.SID} sid
    * @param {string} name
+   * @param {object} options
    */
   function RoomSignaling(localParticipant, sid, name, options) {
     _classCallCheck(this, RoomSignaling);
 
     options = Object.assign({
-      RecordingSignaling: DefaultRecordingSignaling
+      RecordingSignaling: DefaultRecordingSignaling,
+      Timeout: DefaultTimeout
     }, options);
 
     var _this = _possibleConstructorReturn(this, (RoomSignaling.__proto__ || Object.getPrototypeOf(RoomSignaling)).call(this, 'connected', states));
 
     var RecordingSignaling = options.RecordingSignaling;
+
+    var sessionTimeout = new options.Timeout(function () {
+      _this._disconnect(_this._reconnectingError);
+    }, options.sessionTimeout, false);
 
     Object.defineProperties(_this, {
       _mediaConnectionIsReconnecting: {
@@ -11004,6 +12727,13 @@ var RoomSignaling = function (_StateMachine) {
       },
       _options: {
         value: options
+      },
+      _reconnectingError: {
+        value: null,
+        writable: true
+      },
+      _sessionTimeout: {
+        value: sessionTimeout
       },
       dominantSpeakerSid: {
         enumerable: true,
@@ -11032,10 +12762,24 @@ var RoomSignaling = function (_StateMachine) {
       }
     });
 
-    _this.on('mediaConnectionStateChanged', function () {
+    _this.on('connectionStateChanged', function () {
+      if (_this.connectionState === 'failed' && !['disconnected', 'failed'].includes(_this.iceConnectionState)) {
+        _this._disconnect(new MediaDTLSTransportFailedError());
+      }
+    });
+
+    _this.on('iceConnectionStateChanged', function () {
       return maybeUpdateState(_this);
     });
     _this.on('signalingConnectionStateChanged', function () {
+      return maybeUpdateState(_this);
+    });
+
+    // NOTE(mmalavalli): In case "iceConnectionState" is already failed, update
+    // the RoomSignaling state. setTimeout() ensures that the state is updated
+    // after RoomV2's constructor is fully executed, thereby making "signalingConnectionState"
+    // available here.
+    setTimeout(function () {
       return maybeUpdateState(_this);
     });
     return _this;
@@ -11122,6 +12866,10 @@ var RoomSignaling = function (_StateMachine) {
 }(StateMachine);
 
 /**
+ * @event RoomSignaling#event:connectionStateChanged
+ */
+
+/**
  * @event RoomSignaling#event:dominantSpeakerChanged
  */
 
@@ -11138,7 +12886,7 @@ var RoomSignaling = function (_StateMachine) {
  */
 
 /**
- * @event RoomSignaling#event:mediaConnectionStateChanged
+ * @event RoomSignaling#event:iceConnectionStateChanged
  */
 
 /**
@@ -11153,6 +12901,7 @@ var RoomSignaling = function (_StateMachine) {
 
 function maybeUpdateState(roomSignaling) {
   if (roomSignaling.state === 'disconnected' || roomSignaling.signalingConnectionState === 'disconnected') {
+    roomSignaling._sessionTimeout.clear();
     return;
   }
 
@@ -11160,13 +12909,15 @@ function maybeUpdateState(roomSignaling) {
 
   if (roomSignaling.signalingConnectionState === 'reconnecting') {
     newState = roomSignaling.signalingConnectionState;
-  } else if (roomSignaling.mediaConnectionState === 'failed') {
+  } else if (roomSignaling.iceConnectionState === 'failed') {
     roomSignaling._mediaConnectionIsReconnecting = true;
     newState = 'reconnecting';
-  } else if (roomSignaling.mediaConnectionState === 'new' || roomSignaling.mediaConnectionState === 'checking') {
+  } else if (roomSignaling.iceConnectionState === 'new' || roomSignaling.iceConnectionState === 'checking') {
     newState = roomSignaling._mediaConnectionIsReconnecting ? 'reconnecting' : 'connected';
   } else {
     roomSignaling._mediaConnectionIsReconnecting = false;
+    roomSignaling._reconnectingError = null;
+    roomSignaling._sessionTimeout.clear();
     newState = 'connected';
   }
 
@@ -11175,14 +12926,16 @@ function maybeUpdateState(roomSignaling) {
   }
 
   if (newState === 'reconnecting') {
-    roomSignaling.preempt(newState, null, [roomSignaling.signalingConnectionState === 'reconnecting' ? new SignalingConnectionDisconnectedError() : new MediaConnectionError()]);
+    roomSignaling._reconnectingError = roomSignaling.signalingConnectionState === 'reconnecting' ? new SignalingConnectionDisconnectedError() : new MediaConnectionError();
+    roomSignaling._sessionTimeout.start();
+    roomSignaling.preempt(newState, null, [roomSignaling._reconnectingError]);
   } else {
     roomSignaling.preempt(newState);
   }
 }
 
 module.exports = RoomSignaling;
-},{"../statemachine":95,"../util/twilio-video-errors":145,"./recording":74}],78:[function(require,module,exports){
+},{"../statemachine":107,"../util/timeout":155,"../util/twilio-video-errors":157,"./recording":84}],88:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -11212,16 +12965,25 @@ var TrackSignaling = function (_EventEmitter) {
    * @param {string} name
    * @param {Track.Kind} kind
    * @param {boolean} isEnabled
+   * @param {Track.Priority} priority
    */
-  function TrackSignaling(name, kind, isEnabled) {
+  function TrackSignaling(name, kind, isEnabled, priority) {
     _classCallCheck(this, TrackSignaling);
 
     var _this = _possibleConstructorReturn(this, (TrackSignaling.__proto__ || Object.getPrototypeOf(TrackSignaling)).call(this));
 
     var sid = null;
     Object.defineProperties(_this, {
+      _error: {
+        value: null,
+        writable: true
+      },
       _isEnabled: {
         value: isEnabled,
+        writable: true
+      },
+      _priority: {
+        value: priority,
         writable: true
       },
       _trackTransceiver: {
@@ -11251,8 +13013,8 @@ var TrackSignaling = function (_EventEmitter) {
   }
 
   /**
-   * Whether the {@link TrackSignaling} is enabled.
-   * @property {boolean}
+   * Non-null if publication or subscription failed.
+   * @property {?Error} error
    */
 
 
@@ -11319,9 +13081,31 @@ var TrackSignaling = function (_EventEmitter) {
       return this;
     }
   }, {
+    key: 'error',
+    get: function get() {
+      return this._error;
+    }
+
+    /**
+     * Whether the {@link TrackSignaling} is enabled.
+     * @property {boolean}
+     */
+
+  }, {
     key: 'isEnabled',
     get: function get() {
       return this._isEnabled;
+    }
+
+    /**
+     * The {@link TrackSignaling}'s priority.
+     * @property {Track.Priority}
+     */
+
+  }, {
+    key: 'priority',
+    get: function get() {
+      return this._priority;
     }
 
     /**
@@ -11356,16 +13140,20 @@ var TrackSignaling = function (_EventEmitter) {
  */
 
 module.exports = TrackSignaling;
-},{"events":155}],79:[function(require,module,exports){
+},{"events":168}],89:[function(require,module,exports){
 'use strict';
 
 var CancelablePromise = require('../../util/cancelablepromise');
 var DefaultPeerConnectionManager = require('./peerconnectionmanager');
 var DefaultRoomV2 = require('./room');
 var DefaultTransport = require('./twilioconnectiontransport');
-var SignalingConnectionDisconnectedError = require('../../util/twilio-video-errors').SignalingConnectionDisconnectedError;
-var SignalingIncomingMessageInvalidError = require('../../util/twilio-video-errors').SignalingIncomingMessageInvalidError;
-var flatMap = require('../../util').flatMap;
+
+var _require = require('../../util/twilio-video-errors'),
+    SignalingConnectionDisconnectedError = _require.SignalingConnectionDisconnectedError,
+    SignalingIncomingMessageInvalidError = _require.SignalingIncomingMessageInvalidError;
+
+var _require2 = require('../../util'),
+    flatMap = _require2.flatMap;
 
 function createCancelableRoomSignalingPromise(token, wsServer, localParticipant, iceServerSource, encodingParameters, preferredCodecs, options) {
   options = Object.assign({
@@ -11414,6 +13202,10 @@ function createCancelableRoomSignalingPromise(token, wsServer, localParticipant,
           transportOptions.NullInsightsPublisher = options.NullInsightsPublisher;
         }
 
+        if (options.bandwidthProfile) {
+          transportOptions.bandwidthProfile = options.bandwidthProfile;
+        }
+
         transportOptions = Object.assign({
           automaticSubscription: options.automaticSubscription,
           dominantSpeaker: options.dominantSpeaker,
@@ -11434,13 +13226,13 @@ function createCancelableRoomSignalingPromise(token, wsServer, localParticipant,
             reject(cancelationError);
             return;
           }
-
           var localParticipantState = initialState.participant;
           if (!localParticipantState) {
             reject(new SignalingIncomingMessageInvalidError());
             return;
           }
 
+          localParticipant.setSignalingRegion(initialState.options.signaling_region);
           resolve(new RoomV2(localParticipant, initialState, transport, peerConnectionManager, options));
         });
 
@@ -11477,7 +13269,7 @@ function createCancelableRoomSignalingPromise(token, wsServer, localParticipant,
 }
 
 module.exports = createCancelableRoomSignalingPromise;
-},{"../../util":132,"../../util/cancelablepromise":129,"../../util/twilio-video-errors":145,"./peerconnectionmanager":89,"./room":93,"./twilioconnectiontransport":94}],80:[function(require,module,exports){
+},{"../../util":144,"../../util/cancelablepromise":141,"../../util/twilio-video-errors":157,"./peerconnectionmanager":99,"./room":103,"./twilioconnectiontransport":106}],90:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -11565,7 +13357,7 @@ var DominantSpeakerSignaling = function (_EventEmitter) {
  */
 
 module.exports = DominantSpeakerSignaling;
-},{"events":155}],81:[function(require,module,exports){
+},{"events":168}],91:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -11651,7 +13443,7 @@ var IceBox = function () {
 }();
 
 module.exports = IceBox;
-},{"../../util/filter":131}],82:[function(require,module,exports){
+},{"../../util/filter":143}],92:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -11716,6 +13508,13 @@ var IceConnectionMonitor = function () {
         return Array.from(stats.values()).find(function (stat) {
           return stat.type === 'candidate-pair' && stat.nominated;
         });
+      }).then(function (activePairStat) {
+        // NOTE(mpatwardhan): sometimes (JSDK-2667) after getting disconnected while switching network
+        // we may not find active pair. Treat this as 0 bytesReceived so that we count it towards inactivity.
+        return activePairStat || {
+          bytesReceived: 0,
+          timestamp: Math.round(new Date().getTime())
+        };
       }).catch(function () {
         return null;
       });
@@ -11771,7 +13570,7 @@ var IceConnectionMonitor = function () {
 }();
 
 module.exports = IceConnectionMonitor;
-},{"../../util/constants":130}],83:[function(require,module,exports){
+},{"../../util/constants":142}],93:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -11845,7 +13644,7 @@ var SignalingV2 = function (_Signaling) {
 }(Signaling);
 
 module.exports = SignalingV2;
-},{"../":70,"./cancelableroomsignalingpromise":79,"./localparticipant":84}],84:[function(require,module,exports){
+},{"../":80,"./cancelableroomsignalingpromise":89,"./localparticipant":94}],94:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -11861,12 +13660,17 @@ function _inherits(subClass, superClass) { if (typeof superClass !== "function" 
 var LocalParticipantSignaling = require('../localparticipant');
 var LocalTrackPublicationV2 = require('./localtrackpublication');
 
+var _require = require('../../util'),
+    isDeepEqual = _require.isDeepEqual;
+
 /**
  * @extends ParticipantSignaling
+ * @property {BandwidthProfileOptions} bandwidthProfile
  * @property {NetworkQualityConfigurationImpl} networkQualityConfiguration
  * @property {number} revision
  * @emits LocalParticipantV2#updated
  */
+
 
 var LocalParticipantV2 = function (_LocalParticipantSign) {
   _inherits(LocalParticipantV2, _LocalParticipantSign);
@@ -11887,6 +13691,14 @@ var LocalParticipantV2 = function (_LocalParticipantSign) {
     var _this = _possibleConstructorReturn(this, (LocalParticipantV2.__proto__ || Object.getPrototypeOf(LocalParticipantV2)).call(this));
 
     Object.defineProperties(_this, {
+      _bandwidthProfile: {
+        value: null,
+        writable: true
+      },
+      _bandwidthProfileRevision: {
+        value: 0,
+        writable: true
+      },
       _encodingParameters: {
         value: encodingParameters
       },
@@ -11904,6 +13716,22 @@ var LocalParticipantV2 = function (_LocalParticipantSign) {
         writable: true,
         value: 1
       },
+      _signalingRegion: {
+        value: null,
+        writable: true
+      },
+      bandwidthProfile: {
+        enumerable: true,
+        get: function get() {
+          return this._bandwidthProfile;
+        }
+      },
+      bandwidthProfileRevision: {
+        enumerable: true,
+        get: function get() {
+          return this._bandwidthProfileRevision;
+        }
+      },
       networkQualityConfiguration: {
         enumerable: true,
         value: networkQualityConfiguration
@@ -11913,19 +13741,56 @@ var LocalParticipantV2 = function (_LocalParticipantSign) {
         get: function get() {
           return this._revision;
         }
+      },
+      signalingRegion: {
+        enumerable: true,
+        get: function get() {
+          return this._signalingRegion;
+        }
       }
     });
     return _this;
   }
 
   /**
-   * Set the {@link EncodingParameters}.
-   * @param {?EncodingParameters} encodingParameters
-   * @returns {this}
+   * Set the signalingRegion.
+   * @param {string} signalingRegion.
    */
 
 
   _createClass(LocalParticipantV2, [{
+    key: 'setSignalingRegion',
+    value: function setSignalingRegion(signalingRegion) {
+      if (!this._signalingRegion) {
+        this._signalingRegion = signalingRegion;
+      }
+    }
+
+    /**
+     * Update the {@link BandwidthProfileOptions}.
+     * @param {BandwidthProfileOptions} bandwidthProfile
+     */
+
+  }, {
+    key: 'setBandwidthProfile',
+    value: function setBandwidthProfile(bandwidthProfile) {
+      if (!isDeepEqual(this._bandwidthProfile, bandwidthProfile)) {
+        // NOTE(mmalavalli): Object.assign() copies the values of only
+        // the top level properties. In order to deep copy the object, we
+        // stringify and parse the object.
+        this._bandwidthProfile = JSON.parse(JSON.stringify(bandwidthProfile));
+        this._bandwidthProfileRevision++;
+        this.didUpdate();
+      }
+    }
+
+    /**
+     * Set the {@link EncodingParameters}.
+     * @param {?EncodingParameters} encodingParameters
+     * @returns {this}
+     */
+
+  }, {
     key: 'setParameters',
     value: function setParameters(encodingParameters) {
       this._encodingParameters.update(encodingParameters);
@@ -11961,13 +13826,14 @@ var LocalParticipantV2 = function (_LocalParticipantSign) {
      * @protected
      * @param {DataTrackSender|MediaTrackSender} trackSender
      * @param {string} name
+     * @param {Track.Priority} priority
      * @returns {LocalTrackPublicationV2}
      */
 
   }, {
     key: '_createLocalTrackPublicationSignaling',
-    value: function _createLocalTrackPublicationSignaling(trackSender, name) {
-      return new this._LocalTrackPublicationV2(trackSender, name);
+    value: function _createLocalTrackPublicationSignaling(trackSender, name, priority) {
+      return new this._LocalTrackPublicationV2(trackSender, name, priority);
     }
 
     /**
@@ -11975,30 +13841,32 @@ var LocalParticipantV2 = function (_LocalParticipantSign) {
      * or {@link MediaTrackSender} to the {@link LocalParticipantV2}.
      * @param {DataTrackSender|MediaTrackSender} trackSender
      * @param {string} name
+     * @param {Track.Priority} priority
      * @returns {this}
      */
 
   }, {
     key: 'addTrack',
-    value: function addTrack(trackSender, name) {
+    value: function addTrack(trackSender, name, priority) {
       var _this2 = this;
 
-      _get(LocalParticipantV2.prototype.__proto__ || Object.getPrototypeOf(LocalParticipantV2.prototype), 'addTrack', this).call(this, trackSender, name);
+      _get(LocalParticipantV2.prototype.__proto__ || Object.getPrototypeOf(LocalParticipantV2.prototype), 'addTrack', this).call(this, trackSender, name, priority);
       var publication = this.getPublication(trackSender);
 
-      var sid = publication.sid;
+      var isEnabled = publication.isEnabled,
+          updatedPriority = publication.updatedPriority;
 
 
       var updated = function updated() {
         // NOTE(mmalavalli): The LocalParticipantV2's state is only published if
         // the "updated" event is emitted due to LocalTrackPublicationV2's
-        // .isEnabled being toggled. We do not publish if it is fired due to the
+        // .isEnabled or .updatedPriority being changed. We do not publish if it is fired due to the
         // LocalTrackPublicationV2's .sid being set.
-        if (sid === publication.sid) {
+        if (isEnabled !== publication.isEnabled || updatedPriority !== publication.updatedPriority) {
           _this2.didUpdate();
-          return;
+          isEnabled = publication.isEnabled;
+          updatedPriority = publication.updatedPriority;
         }
-        sid = publication.sid;
       };
 
       publication.on('updated', updated);
@@ -12132,7 +14000,7 @@ var LocalParticipantV2 = function (_LocalParticipantSign) {
  */
 
 module.exports = LocalParticipantV2;
-},{"../localparticipant":71,"./localtrackpublication":85}],85:[function(require,module,exports){
+},{"../../util":144,"../localparticipant":81,"./localtrackpublication":95}],95:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -12157,11 +14025,12 @@ var LocalTrackPublicationV2 = function (_LocalTrackPublicatio) {
    * Construct a {@link LocalTrackPublicationV2}.
    * @param {DataTrackSender|MediaTrackSender} trackSender
    * @param {string} name
+   * @param {Track.Priority} priority
    */
-  function LocalTrackPublicationV2(trackSender, name) {
+  function LocalTrackPublicationV2(trackSender, name, priority) {
     _classCallCheck(this, LocalTrackPublicationV2);
 
-    return _possibleConstructorReturn(this, (LocalTrackPublicationV2.__proto__ || Object.getPrototypeOf(LocalTrackPublicationV2)).call(this, trackSender, name));
+    return _possibleConstructorReturn(this, (LocalTrackPublicationV2.__proto__ || Object.getPrototypeOf(LocalTrackPublicationV2)).call(this, trackSender, name, priority));
   }
 
   /**
@@ -12177,7 +14046,8 @@ var LocalTrackPublicationV2 = function (_LocalTrackPublicatio) {
         enabled: this.isEnabled,
         id: this.id,
         kind: this.kind,
-        name: this.name
+        name: this.name,
+        priority: this.updatedPriority
       };
     }
 
@@ -12220,11 +14090,12 @@ var LocalTrackPublicationV2 = function (_LocalTrackPublicatio) {
  * @property {Track.ID} id
  * @property {Track.Kind} kind
  * @property {string} name
+ * @priority {Track.Priority} priority
  * @property {Track.SID} sid
  */
 
 module.exports = LocalTrackPublicationV2;
-},{"../../util/twilio-video-errors":145,"../localtrackpublication":72}],86:[function(require,module,exports){
+},{"../../util/twilio-video-errors":157,"../localtrackpublication":82}],96:[function(require,module,exports){
 /* eslint callback-return:0 */
 'use strict';
 
@@ -12402,7 +14273,7 @@ function next(monitor) {
  */
 
 module.exports = NetworkQualityMonitor;
-},{"../../stats/peerconnectionreportfactory":113,"events":155}],87:[function(require,module,exports){
+},{"../../stats/peerconnectionreportfactory":125,"events":168}],97:[function(require,module,exports){
 'use strict';
 
 var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
@@ -12682,7 +14553,7 @@ function createNetworkQualityInputsMessage(networkQualityInputs, networkQualityR
 }
 
 module.exports = NetworkQualitySignaling;
-},{"../../util/asyncvar":128,"events":155}],88:[function(require,module,exports){
+},{"../../util/asyncvar":140,"events":168}],98:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -12694,6 +14565,8 @@ function _classCallCheck(instance, Constructor) { if (!(instance instanceof Cons
 function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
 
 function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
+var DefaultBackoff = require('backoff');
 
 var _require = require('@twilio/webrtc'),
     DefaultMediaStream = _require.MediaStream,
@@ -12709,7 +14582,10 @@ var _require3 = require('@twilio/webrtc/lib/util/sdp'),
     getSdpFormat = _require3.getSdpFormat;
 
 var _require4 = require('../../util/constants'),
-    DEFAULT_LOG_LEVEL = _require4.DEFAULT_LOG_LEVEL;
+    DEFAULT_ICE_GATHERING_TIMEOUT_MS = _require4.DEFAULT_ICE_GATHERING_TIMEOUT_MS,
+    DEFAULT_LOG_LEVEL = _require4.DEFAULT_LOG_LEVEL,
+    DEFAULT_SESSION_TIMEOUT_SEC = _require4.DEFAULT_SESSION_TIMEOUT_SEC,
+    iceRestartBackoffConfig = _require4.iceRestartBackoffConfig;
 
 var _require5 = require('../../util/sdp'),
     createCodecMapForMediaSection = _require5.createCodecMapForMediaSection,
@@ -12722,13 +14598,15 @@ var _require5 = require('../../util/sdp'),
     unifiedPlanAddOrRewriteTrackIds = _require5.unifiedPlanAddOrRewriteTrackIds,
     unifiedPlanFilterLocalCodecs = _require5.unifiedPlanFilterLocalCodecs;
 
+var DefaultTimeout = require('../../util/timeout');
+
 var _require6 = require('../../util/twilio-video-errors'),
     MediaClientLocalDescFailedError = _require6.MediaClientLocalDescFailedError,
     MediaClientRemoteDescFailedError = _require6.MediaClientRemoteDescFailedError;
 
 var _require7 = require('../../util'),
     buildLogLevels = _require7.buildLogLevels,
-    makeUUID = _require7.makeUUID,
+    isChromeScreenShareTrack = _require7.isChromeScreenShareTrack,
     oncePerTick = _require7.oncePerTick;
 
 var IceBox = require('./icebox');
@@ -12747,7 +14625,9 @@ var isChrome = guess === 'chrome';
 var isFirefox = guess === 'firefox';
 var isSafari = guess === 'safari';
 
-var firefoxMajorVersion = isFirefox ? parseInt(navigator.userAgent.match(/Firefox\/(\d+)/)[1], 10) : null;
+var isRTCRtpSenderParamsSupported = typeof RTCRtpSender !== 'undefined' && typeof RTCRtpSender.prototype.getParameters === 'function' && typeof RTCRtpSender.prototype.setParameters === 'function';
+
+var nInstances = 0;
 
 /*
 PeerConnectionV2 States
@@ -12779,6 +14659,7 @@ var states = {
 /**
  * @extends StateMachine
  * @property {id}
+ * @emits PeerConnectionV2#connectionStateChanged
  * @emits PeerConnectionV2#iceConnectionStateChanged
  * @emits PeerConnectionV2#candidates
  * @emits PeerConnectionV2#description
@@ -12800,19 +14681,25 @@ var PeerConnectionV2 = function (_StateMachine) {
     var _this = _possibleConstructorReturn(this, (PeerConnectionV2.__proto__ || Object.getPrototypeOf(PeerConnectionV2)).call(this, 'open', states));
 
     options = Object.assign({
+      enableDscp: false,
       dummyAudioMediaStreamTrack: null,
+      isChromeScreenShareTrack: isChromeScreenShareTrack,
       iceServers: [],
+      isRTCRtpSenderParamsSupported: isRTCRtpSenderParamsSupported,
       logLevel: DEFAULT_LOG_LEVEL,
       offerOptions: {},
       revertSimulcastForNonVP8MediaSections: revertSimulcastForNonVP8MediaSections,
+      sessionTimeout: DEFAULT_SESSION_TIMEOUT_SEC * 1000,
       setBitrateParameters: setBitrateParameters,
       setCodecPreferences: setCodecPreferences,
       setSimulcast: setSimulcast,
+      Backoff: DefaultBackoff,
       IceConnectionMonitor: DefaultIceConnectionMonitor,
       MediaStream: DefaultMediaStream,
       RTCIceCandidate: DefaultRTCIceCandidate,
       RTCPeerConnection: DefaultRTCPeerConnection,
-      RTCSessionDescription: DefaultRTCSessionDescription
+      RTCSessionDescription: DefaultRTCSessionDescription,
+      Timeout: DefaultTimeout
     }, options);
 
     var configuration = getConfiguration(options);
@@ -12822,21 +14709,25 @@ var PeerConnectionV2 = function (_StateMachine) {
     var localMediaStream = isUnifiedPlan ? null : new options.MediaStream();
     var logLevels = buildLogLevels(options.logLevel);
     var RTCPeerConnection = options.RTCPeerConnection;
+
+    if (options.enableDscp === true) {
+      options.chromeSpecificConstraints = options.chromeSpecificConstraints || {};
+      options.chromeSpecificConstraints.optional = options.chromeSpecificConstraints.optional || [];
+      options.chromeSpecificConstraints.optional.push({ googDscp: true });
+    }
+
+    var log = options.log ? options.log.createLog('signaling', _this) : new Log('webrtc', _this, logLevels);
     var peerConnection = new RTCPeerConnection(configuration, options.chromeSpecificConstraints);
 
     if (options.dummyAudioMediaStreamTrack) {
       peerConnection.addTrack(options.dummyAudioMediaStreamTrack, localMediaStream || new options.MediaStream());
     }
 
-    // NOTE(mroberts): We do this to workaround the following bug:
-    //
-    //   https://bugzilla.mozilla.org/show_bug.cgi?id=1481335
-    //
-    if (isFirefox && firefoxMajorVersion < 65) {
-      peerConnection.createDataChannel(makeUUID());
-    }
-
     Object.defineProperties(_this, {
+      _appliedTrackIdsToAttributes: {
+        value: new Map(),
+        writable: true
+      },
       _dataChannels: {
         value: new Map()
       },
@@ -12847,8 +14738,33 @@ var PeerConnectionV2 = function (_StateMachine) {
         writable: true,
         value: 0
       },
+      _didGenerateLocalCandidates: {
+        writable: true,
+        value: false
+      },
+      _enableDscp: {
+        value: options.enableDscp
+      },
       _encodingParameters: {
         value: encodingParameters
+      },
+      _isChromeScreenShareTrack: {
+        value: options.isChromeScreenShareTrack
+      },
+      _iceGatheringFailed: {
+        value: false,
+        writable: true
+      },
+      _iceGatheringTimeout: {
+        value: new options.Timeout(function () {
+          return _this._handleIceGatheringTimeout();
+        }, DEFAULT_ICE_GATHERING_TIMEOUT_MS, false)
+      },
+      _iceRestartBackoff: {
+        value: options.Backoff.exponential(iceRestartBackoffConfig)
+      },
+      _instanceId: {
+        value: ++nInstances
       },
       _isIceConnectionInactive: {
         writable: true,
@@ -12858,12 +14774,19 @@ var PeerConnectionV2 = function (_StateMachine) {
         writable: true,
         value: false
       },
+      _isIceRestartBackoffInProgress: {
+        writable: true,
+        value: false
+      },
       _isRestartingIce: {
         writable: true,
         value: false
       },
       _isUnifiedPlan: {
         value: isUnifiedPlan
+      },
+      _isRTCRtpSenderParamsSupported: {
+        value: options.isRTCRtpSenderParamsSupported
       },
       _lastIceConnectionState: {
         writable: true,
@@ -12900,7 +14823,7 @@ var PeerConnectionV2 = function (_StateMachine) {
         value: null
       },
       _log: {
-        value: options.log ? options.log.createLog('signaling', _this) : new Log('webrtc', _this, logLevels)
+        value: log
       },
       _remoteCodecMaps: {
         value: new Map()
@@ -12944,6 +14867,12 @@ var PeerConnectionV2 = function (_StateMachine) {
         writable: true,
         value: null
       },
+      _iceReconnectTimeout: {
+        value: new options.Timeout(function () {
+          log.debug('ICE reconnect timed out');
+          _this.close();
+        }, options.sessionTimeout, false)
+      },
       _recycledTransceivers: {
         value: {
           audio: [],
@@ -12951,7 +14880,7 @@ var PeerConnectionV2 = function (_StateMachine) {
         }
       },
       _replaceTrackPromises: {
-        value: []
+        value: new Map()
       },
       _remoteCandidates: {
         writable: true,
@@ -12990,7 +14919,8 @@ var PeerConnectionV2 = function (_StateMachine) {
         value: false
       },
       _trackIdsToAttributes: {
-        value: new Map()
+        value: new Map(),
+        writable: true
       },
       _trackMatcher: {
         writable: true,
@@ -13002,12 +14932,26 @@ var PeerConnectionV2 = function (_StateMachine) {
       }
     });
 
-    encodingParameters.on('changed', oncePerTick(_this.offer.bind(_this)));
+    encodingParameters.on('changed', oncePerTick(function () {
+      if (_this._isRTCRtpSenderParamsSupported) {
+        if (!_this._needsAnswer) {
+          updateEncodingParameters(_this);
+        }
+        return;
+      }
+      _this.offer();
+    }));
+
+    peerConnection.addEventListener('connectionstatechange', _this._handleConnectionStateChange.bind(_this));
     peerConnection.addEventListener('datachannel', _this._handleDataChannelEvent.bind(_this));
     peerConnection.addEventListener('icecandidate', _this._handleIceCandidateEvent.bind(_this));
     peerConnection.addEventListener('iceconnectionstatechange', _this._handleIceConnectionStateChange.bind(_this));
+    peerConnection.addEventListener('icegatheringstatechange', _this._handleIceGatheringStateChange.bind(_this));
     peerConnection.addEventListener('signalingstatechange', _this._handleSignalingStateChange.bind(_this));
     peerConnection.addEventListener('track', _this._handleTrackEvent.bind(_this));
+    _this._iceRestartBackoff.on('ready', function () {
+      return _this._initiateIceRestart();
+    });
 
     var self = _this;
     _this.on('stateChanged', function stateChanged(state) {
@@ -13022,14 +14966,19 @@ var PeerConnectionV2 = function (_StateMachine) {
     return _this;
   }
 
-  /**
-   * The {@link PeerConnectionV2}'s underlying RTCPeerConnection's
-   * RTCIceConnectionState.
-   * @property {RTCIceConnectionState}
-   */
-
-
   _createClass(PeerConnectionV2, [{
+    key: 'toString',
+    value: function toString() {
+      return '[PeerConnectionV2 #' + this._instanceId + ': ' + this.id + ']';
+    }
+
+    /**
+     * The {@link PeerConnectionV2}'s underlying RTCPeerConnection's RTCPeerConnectionState
+     * if supported by the browser, its RTCIceConnectionState otherwise.
+     * @property {RTCPeerConnectionState}
+     */
+
+  }, {
     key: '_addIceCandidate',
 
 
@@ -13045,6 +14994,16 @@ var PeerConnectionV2 = function (_StateMachine) {
       return Promise.resolve().then(function () {
         candidate = new _this2._RTCIceCandidate(candidate);
         return _this2._peerConnection.addIceCandidate(candidate);
+      }).catch(function (error) {
+        // NOTE(mmalavalli): Firefox 68+ now generates an RTCIceCandidate with an
+        // empty candidate string to signal end-of-candidates, followed by a null
+        // candidate. As of now, Chrome and Safari reject this RTCIceCandidate. Since
+        // this does not affect the media connection between Firefox 68+ and Chrome/Safari
+        // in Peer-to-Peer Rooms, we suppress the Error and log a warning message.
+        //
+        // Chrome bug: https://bugs.chromium.org/p/chromium/issues/detail?id=978582
+        //
+        _this2._log.warn('Failed to add RTCIceCandidate ' + (candidate ? '"' + candidate.candidate + '"' : 'null') + ': ' + error.message);
       });
     }
 
@@ -13072,12 +15031,23 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_addOrUpdateTransceiver',
     value: function _addOrUpdateTransceiver(track) {
+      var _this3 = this;
+
       var transceiver = takeRecycledTransceiver(this, track.kind);
       if (transceiver && transceiver.sender) {
-        this._replaceTrackPromises.push(transceiver.sender.replaceTrack(track).then(function () {
+        var oldTrackId = transceiver.sender.track ? transceiver.sender.track.id : null;
+        if (oldTrackId) {
+          this._log.warn('Reusing transceiver: ' + transceiver.mid + '] ' + oldTrackId + ' => ' + track.id);
+        }
+        // NOTE(mpatwardhan):remember this transceiver while we replace track.
+        // we recycle transceivers that are not in use after 'negotiationCompleted', but we want to prevent
+        // this one from getting recycled while replaceTrack is pending.
+        this._replaceTrackPromises.set(transceiver, transceiver.sender.replaceTrack(track).then(function () {
           transceiver.direction = 'sendrecv';
         }, function () {
           // Do nothing.
+        }).finally(function () {
+          _this3._replaceTrackPromises.delete(transceiver);
         }));
         return transceiver;
       }
@@ -13112,42 +15082,42 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_answer',
     value: function _answer(offer) {
-      var _this3 = this;
+      var _this4 = this;
 
       return Promise.resolve().then(function () {
-        if (!_this3._negotiationRole) {
-          _this3._negotiationRole = 'answerer';
+        if (!_this4._negotiationRole) {
+          _this4._negotiationRole = 'answerer';
         }
-        return _this3._setRemoteDescription(offer);
+        return _this4._setRemoteDescription(offer);
       }).catch(function () {
         throw new MediaClientRemoteDescFailedError();
       }).then(function () {
-        return _this3._peerConnection.createAnswer();
+        return _this4._peerConnection.createAnswer();
       }).then(function (answer) {
         if (!isFirefox) {
           answer = workaroundIssue8329(answer);
         }
 
         var description = answer;
-        if (_this3._shouldApplySimulcast) {
-          var updatedSdp = _this3._setSimulcast(answer.sdp, _this3._sdpFormat, _this3._trackIdsToAttributes);
+        if (_this4._shouldApplySimulcast) {
+          var updatedSdp = _this4._setSimulcast(answer.sdp, _this4._sdpFormat, _this4._trackIdsToAttributes);
           // NOTE(syerrapragada): VMS does not support H264 simulcast. So,
           // unset simulcast for sections in local offer where corresponding
           // sections in answer doesn't have vp8 as preferred codec and reapply offer.
-          updatedSdp = _this3._revertSimulcastForNonVP8MediaSections(updatedSdp, answer.sdp, offer.sdp);
+          updatedSdp = _this4._revertSimulcastForNonVP8MediaSections(updatedSdp, answer.sdp, offer.sdp);
           description = {
             type: description.type,
             sdp: updatedSdp
           };
         }
-        return _this3._setLocalDescription(description);
+        return _this4._setLocalDescription(description);
       }).then(function () {
-        return _this3._checkIceBox(offer);
+        return _this4._checkIceBox(offer);
       }).then(function () {
-        return _this3._queuedDescription && _this3._updateDescription(_this3._queuedDescription);
+        return _this4._queuedDescription && _this4._updateDescription(_this4._queuedDescription);
       }).then(function () {
-        _this3._queuedDescription = null;
-        return _this3._maybeReoffer(_this3._peerConnection.localDescription);
+        _this4._queuedDescription = null;
+        return _this4._maybeReoffer(_this4._peerConnection.localDescription);
       }).catch(function (error) {
         throw error instanceof MediaClientRemoteDescFailedError ? error : new MediaClientLocalDescFailedError();
       });
@@ -13165,9 +15135,22 @@ var PeerConnectionV2 = function (_StateMachine) {
     value: function _close() {
       if (this._peerConnection.signalingState !== 'closed') {
         this._peerConnection.close();
+        this.preempt('closed');
         return true;
       }
       return false;
+    }
+
+    /**
+     * Handle a "connectionstatechange" event.
+     * @private
+     * @returns {void}
+     */
+
+  }, {
+    key: '_handleConnectionStateChange',
+    value: function _handleConnectionStateChange() {
+      this.emit('connectionStateChanged');
     }
 
     /**
@@ -13180,14 +15163,14 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_handleDataChannelEvent',
     value: function _handleDataChannelEvent(event) {
-      var _this4 = this;
+      var _this5 = this;
 
       var dataChannel = event.channel;
       var dataTrackReceiver = new DataTrackReceiver(dataChannel);
       this._dataTrackReceivers.add(dataTrackReceiver);
 
       dataChannel.addEventListener('close', function () {
-        _this4._dataTrackReceivers.delete(dataTrackReceiver);
+        _this5._dataTrackReceivers.delete(dataTrackReceiver);
       });
 
       this.emit('trackAdded', dataTrackReceiver);
@@ -13203,7 +15186,7 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_handleGlare',
     value: function _handleGlare(offer) {
-      var _this5 = this;
+      var _this6 = this;
 
       this._log.debug('Glare detected; rolling back');
       if (this._isRestartingIce) {
@@ -13212,12 +15195,13 @@ var PeerConnectionV2 = function (_StateMachine) {
         this._shouldRestartIce = true;
       }
       return Promise.resolve().then(function () {
-        return _this5._setLocalDescription({ type: 'rollback' });
+        _this6._trackIdsToAttributes = new Map(_this6._appliedTrackIdsToAttributes);
+        return _this6._setLocalDescription({ type: 'rollback' });
       }).then(function () {
-        _this5._needsAnswer = false;
-        return _this5._answer(offer);
+        _this6._needsAnswer = false;
+        return _this6._answer(offer);
       }).then(function (didReoffer) {
-        return didReoffer ? Promise.resolve() : _this5._offer();
+        return didReoffer ? Promise.resolve() : _this6._offer();
       });
     }
 
@@ -13232,6 +15216,9 @@ var PeerConnectionV2 = function (_StateMachine) {
     key: '_handleIceCandidateEvent',
     value: function _handleIceCandidateEvent(event) {
       if (event.candidate) {
+        this._log.debug('Clearing ICE gathering timeout');
+        this._didGenerateLocalCandidates = true;
+        this._iceGatheringTimeout.clear();
         this._localCandidates.push(event.candidate);
       }
       var peerConnectionState = {
@@ -13259,35 +15246,38 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_handleIceConnectionStateChange',
     value: function _handleIceConnectionStateChange() {
-      var _this6 = this;
+      var _this7 = this;
 
       var iceConnectionState = this._peerConnection.iceConnectionState;
 
+      var isIceConnectedOrComplete = ['connected', 'complete'].includes(iceConnectionState);
+      var log = this._log;
 
-      this._log.debug('ICE connection state is "' + iceConnectionState + '"');
-
-      // Case 1: Transition to "failed".
-      if (this._lastIceConnectionState !== 'failed' && iceConnectionState === 'failed' && !this._shouldRestartIce && !this._isRestartingIce) {
-        this._log.warn('ICE failed; attempting to restart ICE');
-        this._shouldRestartIce = true;
-        this.offer();
+      log.debug('ICE connection state is "' + iceConnectionState + '"');
+      if (isIceConnectedOrComplete) {
+        this._iceReconnectTimeout.clear();
+        this._iceRestartBackoff.reset();
       }
 
-      // Case 2: Transition from "failed".
-      else if (this._lastIceConnectionState === 'failed' && (iceConnectionState === 'connected' || iceConnectionState === 'completed')) {
-          this._log.info('ICE reconnected');
-        }
+      if (this._lastIceConnectionState !== 'failed' && iceConnectionState === 'failed' && !this._shouldRestartIce && !this._isRestartingIce) {
+        // Case 1: Transition to "failed".
+        log.warn('ICE failed');
+        this._initiateIceRestartBackoff();
+      } else if (['disconnected', 'failed'].includes(this._lastIceConnectionState) && isIceConnectedOrComplete) {
+        // Case 2: Transition from "disconnected" or "failed".
+        log.debug('ICE reconnected');
+      }
 
       this._isIceConnectionInactive = false;
       if (iceConnectionState === 'disconnected') {
         this._iceConnectionMonitor.start(function () {
-          _this6._iceConnectionMonitor.stop();
-          if (!_this6._shouldRestartIce && !_this6._isRestartingIce) {
-            _this6._log.warn('ICE Connection Monitor detected inactivity; attempting to restart ICE');
-            _this6._shouldRestartIce = true;
-            _this6._isIceConnectionInactive = true;
-            _this6.offer();
-            _this6.emit('iceConnectionStateChanged');
+          _this7._iceConnectionMonitor.stop();
+          if (!_this7._shouldRestartIce && !_this7._isRestartingIce) {
+            log.warn('ICE Connection Monitor detected inactivity');
+            _this7._isIceConnectionInactive = true;
+            _this7._initiateIceRestartBackoff();
+            _this7.emit('iceConnectionStateChanged');
+            _this7.emit('connectionStateChanged');
           }
         });
       } else {
@@ -13299,6 +15289,50 @@ var PeerConnectionV2 = function (_StateMachine) {
     }
 
     /**
+     * Handle ICE gathering timeout.
+     * @private
+     * @returns {void}
+     */
+
+  }, {
+    key: '_handleIceGatheringTimeout',
+    value: function _handleIceGatheringTimeout() {
+      this._log.warn('ICE failed to gather any local candidates');
+      this._iceGatheringFailed = true;
+      this._initiateIceRestartBackoff();
+      this.emit('iceConnectionStateChanged');
+      this.emit('connectionStateChanged');
+    }
+
+    /**
+     * Handle an ICE gathering state change event.
+     * @private
+     * @returns {void}
+     */
+
+  }, {
+    key: '_handleIceGatheringStateChange',
+    value: function _handleIceGatheringStateChange() {
+      var iceGatheringState = this._peerConnection.iceGatheringState;
+
+      var log = this._log;
+      log.debug('ICE gathering state is "' + iceGatheringState + '"');
+
+      // NOTE(mmalavalli): Start the ICE gathering timeout only if the RTCPeerConnection
+      // has started gathering candidates for the first time since the initial offer/answer
+      // or an offer/answer with ICE restart.
+      var _iceGatheringTimeout = this._iceGatheringTimeout,
+          delay = _iceGatheringTimeout.delay,
+          isSet = _iceGatheringTimeout.isSet;
+
+      if (iceGatheringState === 'gathering' && !this._didGenerateLocalCandidates && !isSet) {
+        log.debug('Starting ICE gathering timeout: ' + delay);
+        this._iceGatheringFailed = false;
+        this._iceGatheringTimeout.start();
+      }
+    }
+
+    /**
      * Handle a signaling state change event.
      * @private
      * @returns {void}
@@ -13307,8 +15341,8 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_handleSignalingStateChange',
     value: function _handleSignalingStateChange() {
-      if (this._peerConnection.signalingState === 'closed' && this.state !== 'closed') {
-        this.preempt('closed');
+      if (this._peerConnection.signalingState === 'stable') {
+        this._appliedTrackIdsToAttributes = new Map(this._trackIdsToAttributes);
       }
     }
 
@@ -13322,7 +15356,7 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_handleTrackEvent',
     value: function _handleTrackEvent(event) {
-      var _this7 = this;
+      var _this8 = this;
 
       var sdp = this._peerConnection.remoteDescription ? this._peerConnection.remoteDescription.sdp : null;
 
@@ -13347,15 +15381,61 @@ var PeerConnectionV2 = function (_StateMachine) {
       // that owned this MediaStreamTrack before adding the new MediaTrackReceiver.
       this._mediaTrackReceivers.forEach(function (trackReceiver) {
         if (trackReceiver.track.id === mediaTrackReceiver.track.id) {
-          _this7._mediaTrackReceivers.delete(trackReceiver);
+          _this8._mediaTrackReceivers.delete(trackReceiver);
         }
       });
 
       this._mediaTrackReceivers.add(mediaTrackReceiver);
       mediaStreamTrack.addEventListener('ended', function () {
-        return _this7._mediaTrackReceivers.delete(mediaTrackReceiver);
+        return _this8._mediaTrackReceivers.delete(mediaTrackReceiver);
       });
       this.emit('trackAdded', mediaTrackReceiver);
+    }
+
+    /**
+     * Initiate ICE Restart.
+     * @private
+     * @returns {void}
+     */
+
+  }, {
+    key: '_initiateIceRestart',
+    value: function _initiateIceRestart() {
+      if (this._peerConnection.signalingState === 'closed') {
+        return;
+      }
+      var log = this._log;
+      log.warn('Attempting to restart ICE');
+      this._didGenerateLocalCandidates = false;
+      this._isIceRestartBackoffInProgress = false;
+      this._shouldRestartIce = true;
+
+      var _iceReconnectTimeout = this._iceReconnectTimeout,
+          delay = _iceReconnectTimeout.delay,
+          isSet = _iceReconnectTimeout.isSet;
+
+      if (!isSet) {
+        log.debug('Starting ICE reconnect timeout: ' + delay);
+        this._iceReconnectTimeout.start();
+      }
+      this.offer();
+    }
+
+    /**
+     * Schedule an ICE Restart.
+     * @private
+     * @returns {void}
+     */
+
+  }, {
+    key: '_initiateIceRestartBackoff',
+    value: function _initiateIceRestartBackoff() {
+      if (this._peerConnection.signalingState === 'closed' || this._isIceRestartBackoffInProgress) {
+        return;
+      }
+      this._log.warn('An ICE restart has been scheduled');
+      this._isIceRestartBackoffInProgress = true;
+      this._iceRestartBackoff.backoff();
     }
 
     /**
@@ -13418,7 +15498,7 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_offer',
     value: function _offer() {
-      var _this8 = this;
+      var _this9 = this;
 
       var offerOptions = Object.assign({}, this._offerOptions);
       this._needsAnswer = true;
@@ -13427,8 +15507,9 @@ var PeerConnectionV2 = function (_StateMachine) {
         this._isRestartingIce = true;
         offerOptions.iceRestart = true;
       }
-      return Promise.all(this._replaceTrackPromises.splice(0)).then(function () {
-        return _this8._peerConnection.createOffer(offerOptions);
+
+      return Promise.all(this._replaceTrackPromises.values()).then(function () {
+        return _this9._peerConnection.createOffer(offerOptions);
       }).catch(function () {
         throw new MediaClientLocalDescFailedError();
       }).then(function (offer) {
@@ -13436,24 +15517,23 @@ var PeerConnectionV2 = function (_StateMachine) {
           offer = workaroundIssue8329(offer);
         }
 
-        var sdp = _this8._isUnifiedPlan && _this8._peerConnection.remoteDescription ? unifiedPlanFilterLocalCodecs(offer.sdp, _this8._peerConnection.remoteDescription.sdp) : offer.sdp;
+        var sdp = _this9._isUnifiedPlan && _this9._peerConnection.remoteDescription ? unifiedPlanFilterLocalCodecs(offer.sdp, _this9._peerConnection.remoteDescription.sdp) : offer.sdp;
 
-        var updatedSdp = _this8._setCodecPreferences(sdp, _this8._preferredAudioCodecs, _this8._preferredVideoCodecs);
+        var updatedSdp = _this9._setCodecPreferences(sdp, _this9._preferredAudioCodecs, _this9._preferredVideoCodecs);
 
-        _this8._shouldOffer = false;
-        if (!_this8._negotiationRole) {
-          _this8._negotiationRole = 'offerer';
+        _this9._shouldOffer = false;
+        if (!_this9._negotiationRole) {
+          _this9._negotiationRole = 'offerer';
         }
 
-        if (_this8._shouldApplySimulcast) {
-          _this8._localDescriptionWithoutSimulcast = {
+        if (_this9._shouldApplySimulcast) {
+          _this9._localDescriptionWithoutSimulcast = {
             type: 'offer',
             sdp: updatedSdp
           };
-          updatedSdp = _this8._setSimulcast(updatedSdp, _this8._sdpFormat, _this8._trackIdsToAttributes);
+          updatedSdp = _this9._setSimulcast(updatedSdp, _this9._sdpFormat, _this9._trackIdsToAttributes);
         }
-
-        return _this8._setLocalDescription({
+        return _this9._setLocalDescription({
           type: 'offer',
           sdp: updatedSdp
         });
@@ -13525,10 +15605,10 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_rollbackAndApplyOffer',
     value: function _rollbackAndApplyOffer(offer) {
-      var _this9 = this;
+      var _this10 = this;
 
       return this._setLocalDescription({ type: 'rollback' }).then(function () {
-        return _this9._setLocalDescription(offer);
+        return _this10._setLocalDescription(offer);
       });
     }
 
@@ -13542,30 +15622,26 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_setLocalDescription',
     value: function _setLocalDescription(description) {
-      var _this10 = this;
+      var _this11 = this;
 
       return this._peerConnection.setLocalDescription(description).catch(function (error) {
-        _this10._log.warn('Calling setLocalDescription with an RTCSessionDescription of type "' + description.type + '" failed with the error "' + error.message + '".');
+        _this11._log.warn('Calling setLocalDescription with an RTCSessionDescription of type "' + description.type + '" failed with the error "' + error.message + '".');
         if (description.sdp) {
-          _this10._log.warn('The SDP was ' + description.sdp);
+          _this11._log.warn('The SDP was ' + description.sdp);
         }
         throw new MediaClientLocalDescFailedError();
       }).then(function () {
         if (description.type !== 'rollback') {
-          _this10._localDescription = _this10._isUnifiedPlan ? _this10._addOrRewriteLocalTrackIds(description) : description;
-          _this10._localCandidates = [];
+          _this11._localDescription = _this11._isUnifiedPlan ? _this11._addOrRewriteLocalTrackIds(description) : description;
+          _this11._localCandidates = [];
           if (description.type === 'offer') {
-            _this10._descriptionRevision++;
+            _this11._descriptionRevision++;
           } else if (description.type === 'answer') {
-            _this10._lastStableDescriptionRevision = _this10._descriptionRevision;
-            if (_this10._isUnifiedPlan) {
-              updateRecycledTransceivers(_this10);
-              updateLocalCodecs(_this10);
-              updateRemoteCodecMaps(_this10);
-            }
+            _this11._lastStableDescriptionRevision = _this11._descriptionRevision;
+            negotiationCompleted(_this11);
           }
-          _this10._localUfrag = getUfrag(description);
-          _this10.emit('description', _this10.getState());
+          _this11._localUfrag = getUfrag(description);
+          _this11.emit('description', _this11.getState());
         }
       });
     }
@@ -13580,10 +15656,12 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_setRemoteDescription',
     value: function _setRemoteDescription(description) {
-      var _this11 = this;
+      var _this12 = this;
 
       if (description.sdp) {
-        description.sdp = this._setBitrateParameters(description.sdp, isFirefox ? 'TIAS' : 'AS', this._encodingParameters.maxAudioBitrate, this._encodingParameters.maxVideoBitrate);
+        if (!this._isRTCRtpSenderParamsSupported) {
+          description.sdp = this._setBitrateParameters(description.sdp, isFirefox ? 'TIAS' : 'AS', this._encodingParameters.maxAudioBitrate, this._encodingParameters.maxVideoBitrate);
+        }
         description.sdp = this._setCodecPreferences(description.sdp, this._preferredAudioCodecs, this._preferredVideoCodecs);
         // NOTE(mroberts): Do this to reduce our MediaStream count in Firefox. By
         // mapping MediaStream IDs in the SDP to "-", we ensure the "track" event
@@ -13597,32 +15675,34 @@ var PeerConnectionV2 = function (_StateMachine) {
         }
       }
       description = new this._RTCSessionDescription(description);
+      // eslint-disable-next-line consistent-return
       return Promise.resolve().then(function () {
         // NOTE(syerrapragada): VMS does not support H264 simulcast. So,
         // unset simulcast for sections in local offer where corresponding
         // sections in answer doesn't have vp8 as preferred codec and reapply offer.
-        if (description.type === 'answer' && _this11._shouldApplySimulcast) {
-          return _this11._rollbackAndApplyOffer({
-            type: _this11._localDescription.type,
-            sdp: _this11._revertSimulcastForNonVP8MediaSections(_this11._localDescription.sdp, _this11._localDescriptionWithoutSimulcast.sdp, description.sdp)
-          });
+        if (description.type === 'answer' && _this12._shouldApplySimulcast) {
+          var sdpWithoutSimulcastForNonVP8MediaSections = _this12._revertSimulcastForNonVP8MediaSections(_this12._localDescription.sdp, _this12._localDescriptionWithoutSimulcast.sdp, description.sdp);
+          if (sdpWithoutSimulcastForNonVP8MediaSections !== _this12._localDescription.sdp) {
+            return _this12._rollbackAndApplyOffer({
+              type: _this12._localDescription.type,
+              sdp: sdpWithoutSimulcastForNonVP8MediaSections
+            });
+          }
         }
       }).then(function () {
-        return _this11._peerConnection.setRemoteDescription(description);
+        return _this12._peerConnection.setRemoteDescription(description);
       }).then(function () {
-        if (description.type === 'answer' && _this11._isRestartingIce) {
-          _this11._log.debug('An ICE restart was in-progress and is now completed');
-          _this11._isRestartingIce = false;
-        }
-        if (description.type === 'answer' && _this11._isUnifiedPlan) {
-          updateRecycledTransceivers(_this11);
-          updateLocalCodecs(_this11);
-          updateRemoteCodecMaps(_this11);
+        if (description.type === 'answer') {
+          if (_this12._isRestartingIce) {
+            _this12._log.debug('An ICE restart was in-progress and is now completed');
+            _this12._isRestartingIce = false;
+          }
+          negotiationCompleted(_this12);
         }
       }, function (error) {
-        _this11._log.warn('Calling setRemoteDescription with an RTCSessionDescription of type "' + description.type + '" failed with the error "' + error.message + '".');
+        _this12._log.warn('Calling setRemoteDescription with an RTCSessionDescription of type "' + description.type + '" failed with the error "' + error.message + '".');
         if (description.sdp) {
-          _this11._log.warn('The SDP was ' + description.sdp);
+          _this12._log.warn('The SDP was ' + description.sdp);
         }
         throw error;
       });
@@ -13638,7 +15718,7 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: '_updateDescription',
     value: function _updateDescription(description) {
-      var _this12 = this;
+      var _this13 = this;
 
       switch (description.type) {
         case 'answer':
@@ -13664,7 +15744,15 @@ var PeerConnectionV2 = function (_StateMachine) {
             return Promise.resolve();
           }
           if (this._peerConnection.signalingState === 'have-local-offer') {
-            if (this._needsAnswer && this._descriptionRevision === 1) {
+            // NOTE(mpatwardhan): For a peer connection
+            // 1) createOffer always generate SDP with `setup:actpass`
+            // 2) when remote description is set `setup:active`  - the answer generated selects the dtls role of setup:passive
+            // 3) when remote description is set `setup:passive` - the answer generated selects the dtls role of setup:active
+            // 4) when remote description is set `setup:actpass` - the answer generated uses the previously negotiated role (if not negotiated previously setup:active is used)
+            // This test shows the  behavior: https://github.com/twilio/twilio-webrtc.js/blob/master/test/integration/spec/rtcpeerconnection.js#L936
+            // with glare handling (if dtls role was not negotiated before ) the generated answer will set setup:active.
+            // we do not want that. lets wait for "initial negotiation" before attempting glare handling.
+            if (this._needsAnswer && this._lastStableDescriptionRevision === 0) {
               this._queuedDescription = description;
               return Promise.resolve();
             }
@@ -13680,18 +15768,18 @@ var PeerConnectionV2 = function (_StateMachine) {
       // Handle answer or pranswer.
       var revision = description.revision;
       return Promise.resolve().then(function () {
-        return _this12._setRemoteDescription(description);
+        return _this13._setRemoteDescription(description);
       }).catch(function () {
         throw new MediaClientRemoteDescFailedError();
       }).then(function () {
-        _this12._lastStableDescriptionRevision = revision;
-        _this12._needsAnswer = false;
-        return _this12._checkIceBox(description);
+        _this13._lastStableDescriptionRevision = revision;
+        _this13._needsAnswer = false;
+        return _this13._checkIceBox(description);
       }).then(function () {
-        return _this12._queuedDescription && _this12._updateDescription(_this12._queuedDescription);
+        return _this13._queuedDescription && _this13._updateDescription(_this13._queuedDescription);
       }).then(function () {
-        _this12._queuedDescription = null;
-        return _this12._maybeReoffer(_this12._peerConnection.localDescription).then(function () {});
+        _this13._queuedDescription = null;
+        return _this13._maybeReoffer(_this13._peerConnection.localDescription).then(function () {});
       });
     }
 
@@ -13735,7 +15823,7 @@ var PeerConnectionV2 = function (_StateMachine) {
         dataTrackSender.addDataChannel(dataChannel);
         this._dataChannels.set(dataTrackSender, dataChannel);
       } catch (error) {
-        // Do nothing.
+        this._log.warn('Error creating an RTCDataChannel for DataTrack "' + dataTrackSender.id + '": ' + error.message);
       }
     }
 
@@ -13822,7 +15910,7 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: 'offer',
     value: function offer() {
-      var _this13 = this;
+      var _this14 = this;
 
       if (this._needsAnswer || this._isRestartingIce) {
         this._shouldOffer = true;
@@ -13830,12 +15918,12 @@ var PeerConnectionV2 = function (_StateMachine) {
       }
 
       return this.bracket('offering', function (key) {
-        _this13.transition('updating', key);
-        var promise = _this13._needsAnswer || _this13._isRestartingIce ? Promise.resolve() : _this13._offer();
+        _this14.transition('updating', key);
+        var promise = _this14._needsAnswer || _this14._isRestartingIce ? Promise.resolve() : _this14._offer();
         return promise.then(function () {
-          _this13.tryTransition('open', key);
+          _this14.tryTransition('open', key);
         }, function (error) {
-          _this13.tryTransition('open', key);
+          _this14.tryTransition('open', key);
           throw error;
         });
       });
@@ -13894,6 +15982,20 @@ var PeerConnectionV2 = function (_StateMachine) {
     }
 
     /**
+     * Set the ICE reconnect timeout period.
+     * @param {number} period - Period in milliseconds.
+     * @returns {this}
+     */
+
+  }, {
+    key: 'setIceReconnectTimeout',
+    value: function setIceReconnectTimeout(period) {
+      this._iceReconnectTimeout.setDelay(period);
+      this._log.debug('Updated ICE reconnection timeout period:', this._iceReconnectTimeout.delay);
+      return this;
+    }
+
+    /**
      * Update the {@link PeerConnectionV2}.
      * @param {object} peerConnectionState
      * @returns {Promise<void>}
@@ -13902,29 +16004,29 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: 'update',
     value: function update(peerConnectionState) {
-      var _this14 = this;
+      var _this15 = this;
 
       return this.bracket('updating', function (key) {
-        if (_this14.state === 'closed') {
+        if (_this15.state === 'closed') {
           return Promise.resolve();
         }
 
-        _this14.transition('updating', key);
+        _this15.transition('updating', key);
 
         var updates = [];
 
         if (peerConnectionState.ice) {
-          updates.push(_this14._updateIce(peerConnectionState.ice));
+          updates.push(_this15._updateIce(peerConnectionState.ice));
         }
 
         if (peerConnectionState.description) {
-          updates.push(_this14._updateDescription(peerConnectionState.description));
+          updates.push(_this15._updateDescription(peerConnectionState.description));
         }
 
         return Promise.all(updates).then(function () {
-          _this14.tryTransition('open', key);
+          _this15.tryTransition('open', key);
         }, function (error) {
-          _this14.tryTransition('open', key);
+          _this15.tryTransition('open', key);
           throw error;
         });
       });
@@ -13938,16 +16040,28 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: 'getStats',
     value: function getStats() {
-      var _this15 = this;
+      var _this16 = this;
 
       return getStatistics(this._peerConnection).then(function (response) {
-        return rewriteTrackIds(_this15, response);
+        return rewriteTrackIds(_this16, response);
       });
     }
   }, {
+    key: 'connectionState',
+    get: function get() {
+      return this.iceConnectionState === 'failed' ? 'failed' : this._peerConnection.connectionState || this.iceConnectionState;
+    }
+
+    /**
+     * The {@link PeerConnectionV2}'s underlying RTCPeerConnection's
+     * RTCIceConnectionState.
+     * @property {RTCIceConnectionState}
+     */
+
+  }, {
     key: 'iceConnectionState',
     get: function get() {
-      return this._isIceConnectionInactive && this._peerConnection.iceConnectionState === 'disconnected' ? 'failed' : this._peerConnection.iceConnectionState;
+      return this._isIceConnectionInactive && this._peerConnection.iceConnectionState === 'disconnected' || this._iceGatheringFailed ? 'failed' : this._peerConnection.iceConnectionState;
     }
 
     /**
@@ -13959,7 +16073,11 @@ var PeerConnectionV2 = function (_StateMachine) {
   }, {
     key: 'isApplicationSectionNegotiated',
     get: function get() {
-      return this._peerConnection.localDescription ? getMediaSections(this._peerConnection.localDescription.sdp, 'application').length > 0 : false;
+      if (this._peerConnection.signalingState !== 'closed') {
+        // accessing .localDescription in 'closed' state causes it throw exceptions.
+        return this._peerConnection.localDescription ? getMediaSections(this._peerConnection.localDescription.sdp, 'application').length > 0 : false;
+      }
+      return true;
     }
   }]);
 
@@ -13988,6 +16106,10 @@ function rewriteTrackIds(pcv2, response) {
 /**
  * @event PeerConnectionV2#candidates
  * @param {object} candidates
+ */
+
+/**
+ * @event PeerConnectionV2#connectionStateChanged
  */
 
 /**
@@ -14050,8 +16172,8 @@ function filterOutMediaStreamIds(sdp) {
  * @param {RTCRtpTransceiver} transceiver
  * @returns {boolean}
  */
-function shouldRecycleTransceiver(transceiver) {
-  return !transceiver.stopped && (transceiver.currentDirection === 'inactive' || transceiver.currentDirection === 'recvonly' || transceiver.direction === 'recvonly');
+function shouldRecycleTransceiver(transceiver, pcv2) {
+  return !transceiver.stopped && !pcv2._replaceTrackPromises.has(transceiver) && (transceiver.currentDirection === 'inactive' || transceiver.currentDirection === 'recvonly' || transceiver.direction === 'recvonly');
 }
 
 /**
@@ -14133,15 +16255,104 @@ function updateRecycledTransceivers(pcv2) {
   pcv2._recycledTransceivers.audio = [];
   pcv2._recycledTransceivers.video = [];
   pcv2._peerConnection.getTransceivers().forEach(function (transceiver) {
-    if (shouldRecycleTransceiver(transceiver)) {
+    if (shouldRecycleTransceiver(transceiver, pcv2)) {
       var track = transceiver.receiver.track;
       pcv2._recycledTransceivers[track.kind].push(transceiver);
     }
   });
 }
 
+/**
+ * Perform certain updates after an SDP negotiation is completed.
+ * @param {PeerConnectionV2} pcv2
+ * @returns {void}
+ */
+function negotiationCompleted(pcv2) {
+  if (pcv2._isUnifiedPlan) {
+    updateRecycledTransceivers(pcv2);
+    updateLocalCodecs(pcv2);
+    updateRemoteCodecMaps(pcv2);
+  }
+  if (pcv2._isRTCRtpSenderParamsSupported) {
+    updateEncodingParameters(pcv2);
+  }
+}
+
+/**
+ * Update the RTCRtpEncodingParameters of all active RTCRtpSenders.
+ * @param {PeerConnectionV2} pcv2
+ * @returns {void}
+ */
+function updateEncodingParameters(pcv2) {
+  var _pcv2$_encodingParame = pcv2._encodingParameters,
+      maxAudioBitrate = _pcv2$_encodingParame.maxAudioBitrate,
+      maxVideoBitrate = _pcv2$_encodingParame.maxVideoBitrate;
+
+
+  var maxBitrates = new Map([['audio', maxAudioBitrate], ['video', maxVideoBitrate]]);
+
+  pcv2._peerConnection.getSenders().filter(function (sender) {
+    return sender.track;
+  }).forEach(function (sender) {
+    var maxBitrate = maxBitrates.get(sender.track.kind);
+    var params = sender.getParameters();
+
+    if (maxBitrate === null || maxBitrate === 0) {
+      removeMaxBitrate(params);
+    } else if (pcv2._isChromeScreenShareTrack(sender.track)) {
+      // NOTE(mpatwardhan): Sometimes (JSDK-2557) chrome does not send any bytes on screen track if MaxBitRate is set on it via setParameters,
+      // To workaround this issue we will not apply maxBitrate if the track appears to be a screen share track created by chrome
+      pcv2._log.warn('Not setting maxBitrate for ' + sender.track.kind + ' Track ' + sender.track.id + ' because it appears to be screen share track: ' + sender.track.label);
+    } else {
+      setMaxBitrate(params, maxBitrate);
+    }
+
+    if (!isFirefox && pcv2._enableDscp && params.encodings.length > 0) {
+      // NOTE(mmalavalli): "networkPriority" is a per-sender property and not
+      // a per-encoding-layer property. So, we set the value only on the first
+      // encoding layer. Any attempt to set the value on subsequent encoding
+      // layers (in the case of simulcast) will result in the Promise returned
+      // by RTCRtpSender.setParameters() being rejected.
+      params.encodings[0].networkPriority = 'high';
+    }
+
+    sender.setParameters(params).catch(function (error) {
+      pcv2._log.warn('Error while setting encodings parameters for ' + sender.track.kind + ' Track ' + sender.track.id + ': ' + (error.message || error.name));
+    });
+  });
+}
+
+/**
+ * Remove maxBitrate from the RTCRtpSendParameters' encodings.
+ * @param {RTCRtpSendParameters} params
+ * @returns {void}
+ */
+function removeMaxBitrate(params) {
+  if (Array.isArray(params.encodings)) {
+    params.encodings.forEach(function (encoding) {
+      return delete encoding.maxBitrate;
+    });
+  }
+}
+
+/**
+ * Set the given maxBitrate in the RTCRtpSendParameters' encodings.
+ * @param {RTCRtpSendParameters} params
+ * @param {number} maxBitrate
+ * @returns {void}
+ */
+function setMaxBitrate(params, maxBitrate) {
+  if (isFirefox) {
+    params.encodings = [{ maxBitrate: maxBitrate }];
+  } else {
+    params.encodings.forEach(function (encoding) {
+      encoding.maxBitrate = maxBitrate;
+    });
+  }
+}
+
 module.exports = PeerConnectionV2;
-},{"../../data/receiver":26,"../../media/track/receiver":51,"../../statemachine":95,"../../util":132,"../../util/constants":130,"../../util/log":135,"../../util/sdp":136,"../../util/sdp/issue8329":137,"../../util/sdp/trackmatcher/identity":139,"../../util/sdp/trackmatcher/mid":140,"../../util/sdp/trackmatcher/ordered":141,"../../util/twilio-video-errors":145,"./icebox":81,"./iceconnectionmonitor.js":82,"@twilio/webrtc":3,"@twilio/webrtc/lib/util":16,"@twilio/webrtc/lib/util/sdp":18}],89:[function(require,module,exports){
+},{"../../data/receiver":35,"../../media/track/receiver":61,"../../statemachine":107,"../../util":144,"../../util/constants":142,"../../util/log":147,"../../util/sdp":148,"../../util/sdp/issue8329":149,"../../util/sdp/trackmatcher/identity":151,"../../util/sdp/trackmatcher/mid":152,"../../util/sdp/trackmatcher/ordered":153,"../../util/timeout":155,"../../util/twilio-video-errors":157,"./icebox":91,"./iceconnectionmonitor.js":92,"@twilio/webrtc":3,"@twilio/webrtc/lib/util":16,"@twilio/webrtc/lib/util/sdp":18,"backoff":20}],99:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -14173,6 +16384,7 @@ var isFirefox = guessBrowser() === 'firefox';
  * {@link PeerConnectionManager} manages multiple {@link PeerConnectionV2}s.
  * @extends QueueingEventEmitter
  * @emits PeerConnectionManager#candidates
+ * @emits PeerConnectionManager#connectionStateChanged
  * @emits PeerConnectionManager#description
  * @emits PeerConnectionManager#iceConnectionStateChanged
  * @emits PeerConnectionManager#trackAdded
@@ -14219,6 +16431,10 @@ var PeerConnectionManager = function (_QueueingEventEmitter) {
         writable: true,
         value: util.defer()
       },
+      _connectionState: {
+        value: 'new',
+        writable: true
+      },
       _dummyAudioTrackSender: {
         value: audioContext ? new MediaTrackSender(createDummyAudioMediaStreamTrack(audioContext)) : null
       },
@@ -14235,6 +16451,10 @@ var PeerConnectionManager = function (_QueueingEventEmitter) {
       _dataTrackSenders: {
         writable: true,
         value: new Set()
+      },
+      _lastConnectionState: {
+        value: 'new',
+        writable: true
       },
       _lastIceConnectionState: {
         writable: true,
@@ -14253,6 +16473,10 @@ var PeerConnectionManager = function (_QueueingEventEmitter) {
       _preferredCodecs: {
         value: preferredCodecs
       },
+      _sessionTimeout: {
+        value: null,
+        writable: true
+      },
       _PeerConnectionV2: {
         value: options.PeerConnectionV2
       }
@@ -14261,9 +16485,9 @@ var PeerConnectionManager = function (_QueueingEventEmitter) {
   }
 
   /**
-   * A summarized RTCIceConnectionState across all the
+   * A summarized RTCPeerConnectionState across all the
    * {@link PeerConnectionManager}'s underlying {@link PeerConnectionV2}s.
-   * @property {RTCIceConnectionState}
+   * @property {RTCPeerConnectionState}
    */
 
 
@@ -14321,7 +16545,9 @@ var PeerConnectionManager = function (_QueueingEventEmitter) {
         var options = Object.assign({
           dummyAudioMediaStreamTrack: this._dummyAudioTrackSender ? this._dummyAudioTrackSender.track : null,
           offerOptions: this._offerOptions
-        }, configuration);
+        }, this._sessionTimeout ? {
+          sessionTimeout: this._sessionTimeout
+        } : {}, configuration);
 
         try {
           peerConnection = new _PeerConnectionV(id, this._encodingParameters, this._preferredCodecs, options);
@@ -14338,8 +16564,12 @@ var PeerConnectionManager = function (_QueueingEventEmitter) {
             peerConnection.removeListener('stateChanged', stateChanged);
             self._peerConnections.delete(peerConnection.id);
             self._closedPeerConnectionIds.add(peerConnection.id);
+            updateConnectionState(self);
             updateIceConnectionState(self);
           }
+        });
+        peerConnection.on('connectionStateChanged', function () {
+          return updateConnectionState(_this2);
         });
         peerConnection.on('iceConnectionStateChanged', function () {
           return updateIceConnectionState(_this2);
@@ -14455,7 +16685,25 @@ var PeerConnectionManager = function (_QueueingEventEmitter) {
     }
 
     /**
-     * Set the {@link DataTrackSender}s and {@link MediaTrackSenders} on the
+     * Set the ICE reconnect timeout period for all {@link PeerConnectionV2}s.
+     * @param {number} period - Period in milliseconds.
+     * @returns {this}
+     */
+
+  }, {
+    key: 'setIceReconnectTimeout',
+    value: function setIceReconnectTimeout(period) {
+      if (this._sessionTimeout === null) {
+        this._peerConnections.forEach(function (peerConnection) {
+          peerConnection.setIceReconnectTimeout(period);
+        });
+        this._sessionTimeout = period;
+      }
+      return this;
+    }
+
+    /**
+     * Set the {@link DataTrackSender}s and {@link MediaTrackSender}s on the
      * {@link PeerConnectionManager}'s underlying {@link PeerConnectionV2}s.
      * @param {Array<DataTrackSender|MediaTrackSender>} trackSenders
      * @returns {this}
@@ -14528,6 +16776,18 @@ var PeerConnectionManager = function (_QueueingEventEmitter) {
       });
     }
   }, {
+    key: 'connectionState',
+    get: function get() {
+      return this._connectionState;
+    }
+
+    /**
+     * A summarized RTCIceConnectionState across all the
+     * {@link PeerConnectionManager}'s underlying {@link PeerConnectionV2}s.
+     * @property {RTCIceConnectionState}
+     */
+
+  }, {
     key: 'iceConnectionState',
     get: function get() {
       return this._iceConnectionState;
@@ -14553,6 +16813,10 @@ function createDummyAudioMediaStreamTrack(audioContext) {
 /**
  * @event {PeerConnectionManager#candidates}
  * @param {object} candidates
+ */
+
+/**
+ * @event {PeerConnectionManager#connectionStateChanged}
  */
 
 /**
@@ -14652,20 +16916,21 @@ function getMediaTrackSenderChanges(peerConnectionManager, mediaTrackSenders) {
 }
 
 /**
- * This object maps RTCIceConnectionState values to a "rank".
+ * This object maps RTCIceConnectionState and RTCPeerConnectionState values to a "rank".
  */
 var toRank = {
   new: 0,
   checking: 1,
-  connected: 2,
-  completed: 3,
+  connecting: 2,
+  connected: 3,
+  completed: 4,
   disconnected: -1,
   failed: -2,
   closed: -3
 };
 
 /**
- * This object maps "rank" back to RTCIceConnectionState values.
+ * This object maps "rank" back to RTCIceConnectionState or RTCPeerConnectionState values.
  */
 var fromRank = void 0;
 
@@ -14682,11 +16947,11 @@ function createFromRank() {
 }
 
 /**
- * Summarize ICE connection stats.
- * @param {Array<RTCIceConnectionState>} states
- * @returns {RTCIceConnectionState} summary
+ * Summarize RTCIceConnectionStates or RTCPeerConnectionStates.
+ * @param {Array<RTCIceConnectionState>|Array<RTCPeerConnectionState>} states
+ * @returns {RTCIceConnectionState|RTCPeerConnectionState} summary
  */
-function summarizeIceConnectionStates(states) {
+function summarizeIceOrPeerConnectionStates(states) {
   if (!states.length) {
     return 'new';
   }
@@ -14704,7 +16969,7 @@ function summarizeIceConnectionStates(states) {
  */
 function updateIceConnectionState(pcm) {
   pcm._lastIceConnectionState = pcm.iceConnectionState;
-  pcm._iceConnectionState = summarizeIceConnectionStates([].concat(_toConsumableArray(pcm._peerConnections.values())).map(function (pcv2) {
+  pcm._iceConnectionState = summarizeIceOrPeerConnectionStates([].concat(_toConsumableArray(pcm._peerConnections.values())).map(function (pcv2) {
     return pcv2.iceConnectionState;
   }));
   if (pcm.iceConnectionState !== pcm._lastIceConnectionState) {
@@ -14712,8 +16977,24 @@ function updateIceConnectionState(pcm) {
   }
 }
 
+/**
+ * Update the {@link PeerConnectionManager}'s `connectionState`, and emit a
+ * "connectionStateChanged" event, if necessary.
+ * @param {PeerConnectionManager} pcm
+ * @returns {void}
+ */
+function updateConnectionState(pcm) {
+  pcm._lastConnectionState = pcm.connectionState;
+  pcm._connectionState = summarizeIceOrPeerConnectionStates([].concat(_toConsumableArray(pcm._peerConnections.values())).map(function (pcv2) {
+    return pcv2.connectionState;
+  }));
+  if (pcm.connectionState !== pcm._lastConnectionState) {
+    pcm.emit('connectionStateChanged');
+  }
+}
+
 module.exports = PeerConnectionManager;
-},{"../../media/track/sender":60,"../../queueingeventemitter":66,"../../util":132,"../../util/twilio-video-errors":145,"../../webaudio/audiocontext":147,"./peerconnection":88,"@twilio/webrtc/lib/util":16}],90:[function(require,module,exports){
+},{"../../media/track/sender":70,"../../queueingeventemitter":76,"../../util":144,"../../util/twilio-video-errors":157,"../../webaudio/audiocontext":160,"./peerconnection":98,"@twilio/webrtc/lib/util":16}],100:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -14781,7 +17062,7 @@ var RecordingV2 = function (_RecordingSignaling) {
  */
 
 module.exports = RecordingV2;
-},{"../recording":74}],91:[function(require,module,exports){
+},{"../recording":84}],101:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -14889,8 +17170,16 @@ var RemoteParticipantV2 = function (_RemoteParticipantSig) {
         }
       });
 
-      if (participantState.state === 'disconnected' && this.state === 'connected') {
-        this.preempt('disconnected');
+      switch (participantState.state) {
+        case 'disconnected':
+          this.disconnect();
+          break;
+        case 'reconnecting':
+          this.reconnecting();
+          break;
+        case 'connected':
+          this.connect(this.sid, this.identity);
+          break;
       }
 
       return this;
@@ -14901,7 +17190,7 @@ var RemoteParticipantV2 = function (_RemoteParticipantSig) {
 }(RemoteParticipantSignaling);
 
 module.exports = RemoteParticipantV2;
-},{"../remoteparticipant":75,"./remotetrackpublication":92}],92:[function(require,module,exports){
+},{"../remoteparticipant":85,"./remotetrackpublication":102}],102:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -14928,7 +17217,7 @@ var RemoteTrackPublicationV2 = function (_RemoteTrackPublicati) {
   function RemoteTrackPublicationV2(track) {
     _classCallCheck(this, RemoteTrackPublicationV2);
 
-    return _possibleConstructorReturn(this, (RemoteTrackPublicationV2.__proto__ || Object.getPrototypeOf(RemoteTrackPublicationV2)).call(this, track.sid, track.name, track.kind, track.enabled));
+    return _possibleConstructorReturn(this, (RemoteTrackPublicationV2.__proto__ || Object.getPrototypeOf(RemoteTrackPublicationV2)).call(this, track.sid, track.name, track.kind, track.enabled, track.priority));
   }
 
   /**
@@ -14945,6 +17234,7 @@ var RemoteTrackPublicationV2 = function (_RemoteTrackPublicati) {
     key: 'update',
     value: function update(track) {
       this.enable(track.enabled);
+      this.setPriority(track.priority);
       return this;
     }
   }]);
@@ -14955,11 +17245,11 @@ var RemoteTrackPublicationV2 = function (_RemoteTrackPublicati) {
 /**
  * The Room Signaling Protocol (RSP) representation of a {@link RemoteTrackPublicationV2}.
  * @typedef {LocalTrackPublicationV2#Representation} RemoteTrackPublicationV2#Representation
- * @property (boolean} subscribed
+ * @property {boolean} subscribed
  */
 
 module.exports = RemoteTrackPublicationV2;
-},{"../remotetrackpublication":76}],93:[function(require,module,exports){
+},{"../remotetrackpublication":86}],103:[function(require,module,exports){
 'use strict';
 
 var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }();
@@ -14967,6 +17257,8 @@ var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = [
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
 
 var _get = function get(object, property, receiver) { if (object === null) object = Function.prototype; var desc = Object.getOwnPropertyDescriptor(object, property); if (desc === undefined) { var parent = Object.getPrototypeOf(object); if (parent === null) { return undefined; } else { return get(parent, property, receiver); } } else if ("value" in desc) { return desc.value; } else { var getter = desc.get; if (getter === undefined) { return undefined; } return getter.call(receiver); } };
+
+function _toConsumableArray(arr) { if (Array.isArray(arr)) { for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) { arr2[i] = arr[i]; } return arr2; } else { return Array.from(arr); } }
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
@@ -14981,8 +17273,19 @@ var RecordingV2 = require('./recording');
 var RoomSignaling = require('../room');
 var RemoteParticipantV2 = require('./remoteparticipant');
 var StatsReport = require('../../stats/statsreport');
-var util = require('../../util');
-var createTwilioError = require('../../util/twilio-video-errors').createTwilioError;
+var TrackPrioritySignaling = require('./trackprioritysignaling');
+var TrackSwitchOffSignaling = require('./trackswitchoffsignaling');
+
+var _require = require('../../util'),
+    DEFAULT_SESSION_TIMEOUT_SEC = _require.constants.DEFAULT_SESSION_TIMEOUT_SEC,
+    createBandwidthProfilePayload = _require.createBandwidthProfilePayload,
+    defer = _require.defer,
+    filterObject = _require.filterObject,
+    flatMap = _require.flatMap,
+    oncePerTick = _require.oncePerTick;
+
+var _require2 = require('../../util/twilio-video-errors'),
+    createTwilioError = _require2.createTwilioError;
 
 var STATS_PUBLISH_INTERVAL_MS = 1000;
 
@@ -14996,14 +17299,25 @@ var RoomV2 = function (_RoomSignaling) {
   function RoomV2(localParticipant, initialState, transport, peerConnectionManager, options) {
     _classCallCheck(this, RoomV2);
 
+    initialState.options = Object.assign({
+      session_timeout: DEFAULT_SESSION_TIMEOUT_SEC
+    }, initialState.options);
+
     options = Object.assign({
       DominantSpeakerSignaling: DominantSpeakerSignaling,
       NetworkQualityMonitor: NetworkQualityMonitor,
       NetworkQualitySignaling: NetworkQualitySignaling,
       RecordingSignaling: RecordingV2,
       RemoteParticipantV2: RemoteParticipantV2,
+      TrackPrioritySignaling: TrackPrioritySignaling,
+      TrackSwitchOffSignaling: TrackSwitchOffSignaling,
+      bandwidthProfile: null,
+      sessionTimeout: initialState.options.session_timeout * 1000,
       statsPublishIntervalMs: STATS_PUBLISH_INTERVAL_MS
     }, options);
+
+    localParticipant.setBandwidthProfile(options.bandwidthProfile);
+    peerConnectionManager.setIceReconnectTimeout(options.sessionTimeout);
 
     var _this = _possibleConstructorReturn(this, (RoomV2.__proto__ || Object.getPrototypeOf(RoomV2)).call(this, localParticipant, initialState.sid, initialState.name, options));
 
@@ -15027,6 +17341,10 @@ var RoomV2 = function (_RoomSignaling) {
       },
       _NetworkQualitySignaling: {
         value: options.NetworkQualitySignaling
+      },
+      _lastBandwidthProfileRevision: {
+        value: localParticipant.bandwidthProfileRevision,
+        writable: true
       },
       _networkQualityMonitor: {
         value: null,
@@ -15062,26 +17380,52 @@ var RoomV2 = function (_RoomSignaling) {
       _subscriptionFailures: {
         value: new Map()
       },
+      _trackPriorityPromise: {
+        value: null,
+        writable: true
+      },
+      _trackPrioritySignaling: {
+        value: null,
+        writable: true
+      },
+      _trackSwitchOffPromise: {
+        value: null,
+        writable: true
+      },
+      _trackSwitchOffSignaling: {
+        value: null,
+        writable: true
+      },
+      _TrackPrioritySignaling: {
+        value: options.TrackPrioritySignaling
+      },
+      _TrackSwitchOffSignaling: {
+        value: options.TrackSwitchOffSignaling
+      },
       _transport: {
         value: transport
       },
       _trackReceiverDeferreds: {
         value: new Map()
+      },
+      mediaRegion: {
+        enumerable: true,
+        value: initialState.options.media_region || null
       }
     });
 
     handleLocalParticipantEvents(_this, localParticipant);
     handlePeerConnectionEvents(_this, peerConnectionManager);
     handleTransportEvents(_this, transport);
-    periodicallyPublishStats(_this, localParticipant, transport, options.statsPublishIntervalMs);
+    periodicallyPublishStats(_this, transport, options.statsPublishIntervalMs);
 
     _this._update(initialState);
     return _this;
   }
 
   /**
-   * The Signaling Connection State
-   * @property {string} - "connected", "reconnecting", "disconnected"
+   * The PeerConnection state.
+   * @property {RTCPeerConnectionState}
    */
 
 
@@ -15103,7 +17447,7 @@ var RoomV2 = function (_RoomSignaling) {
   }, {
     key: '_getOrCreateTrackReceiverDeferred',
     value: function _getOrCreateTrackReceiverDeferred(id) {
-      var deferred = this._trackReceiverDeferreds.get(id) || util.defer();
+      var deferred = this._trackReceiverDeferreds.get(id) || defer();
       var trackReceivers = this._peerConnectionManager.getTrackReceivers();
 
       // NOTE(mmalavalli): In Firefox, there can be instances where a MediaStreamTrack
@@ -15179,6 +17523,19 @@ var RoomV2 = function (_RoomSignaling) {
      */
 
   }, {
+    key: '_getTrackSidsToTrackSignalings',
+    value: function _getTrackSidsToTrackSignalings() {
+      var trackSidsToTrackSignalings = flatMap(this.participants, function (participant) {
+        return Array.from(participant.tracks);
+      });
+      return new Map(trackSidsToTrackSignalings);
+    }
+
+    /**
+     * @private
+     */
+
+  }, {
     key: '_getOrCreateRemoteParticipant',
     value: function _getOrCreateRemoteParticipant(participantState) {
       var RemoteParticipantV2 = this._RemoteParticipantV2;
@@ -15194,6 +17551,7 @@ var RoomV2 = function (_RoomSignaling) {
           }
         });
         this.connectParticipant(participant);
+        participant.setTrackPrioritySignaling(this._trackPrioritySignaling);
       }
       return participant;
     }
@@ -15215,9 +17573,28 @@ var RoomV2 = function (_RoomSignaling) {
      */
 
   }, {
+    key: '_maybeAddBandwidthProfile',
+    value: function _maybeAddBandwidthProfile(update) {
+      var _localParticipant = this.localParticipant,
+          bandwidthProfile = _localParticipant.bandwidthProfile,
+          bandwidthProfileRevision = _localParticipant.bandwidthProfileRevision;
+
+      if (bandwidthProfile && this._lastBandwidthProfileRevision < bandwidthProfileRevision) {
+        this._lastBandwidthProfileRevision = bandwidthProfileRevision;
+        return Object.assign({
+          bandwidth_profile: createBandwidthProfilePayload(bandwidthProfile)
+        }, update);
+      }
+      return update;
+    }
+    /**
+     * @private
+     */
+
+  }, {
     key: '_publishNewLocalParticipantState',
     value: function _publishNewLocalParticipantState() {
-      this._transport.publish(this._getState());
+      this._transport.publish(this._maybeAddBandwidthProfile(this._getState()));
     }
 
     /**
@@ -15268,6 +17645,7 @@ var RoomV2 = function (_RoomSignaling) {
 
       var participantsToKeep = new Set();
 
+      // eslint-disable-next-line no-warning-comments
       // TODO(mroberts): Remove me once the Server is fixed.
       (roomState.participants || []).forEach(function (participantState) {
         if (participantState.sid === _this3.localParticipant.sid || _this3._disconnectedParticipantSids.has(participantState.sid)) {
@@ -15288,6 +17666,7 @@ var RoomV2 = function (_RoomSignaling) {
 
       handleSubscriptions(this);
 
+      // eslint-disable-next-line no-warning-comments
       // TODO(mroberts): Remove me once the Server is fixed.
       /* eslint camelcase:0 */
       if (roomState.peer_connections) {
@@ -15320,7 +17699,90 @@ var RoomV2 = function (_RoomSignaling) {
         this._setupDataTransportBackedNetworkQualityMonitor(roomState.media_signaling.network_quality.transport.label);
       }
 
+      if (!this._trackPriorityPromise && roomState.media_signaling && roomState.media_signaling.track_priority && roomState.media_signaling.track_priority.transport && roomState.media_signaling.track_priority.transport.type === 'data-channel') {
+        this._setupTrackPrioritySignaling(roomState.media_signaling.track_priority.transport.label);
+      }
+
+      if (!this._trackSwitchOffPromise && roomState.media_signaling && roomState.media_signaling.track_switch_off && roomState.media_signaling.track_switch_off.transport && roomState.media_signaling.track_switch_off.transport.type === 'data-channel') {
+        this._setupTrackSwitchOffMonitor(roomState.media_signaling.track_switch_off.transport.label);
+      }
+
       return this;
+    }
+
+    // track priority signaling MSP is now used only for subscribe side priority changes.
+    // publisher side priority changes and notifications are handled by RSP.
+
+  }, {
+    key: '_setupTrackPrioritySignaling',
+    value: function _setupTrackPrioritySignaling(id) {
+      var _this4 = this;
+
+      this._teardownTrackPrioritySignaling();
+      var trackPriorityPromise = this._getTrackReceiver(id).then(function (receiver) {
+        if (receiver.kind !== 'data') {
+          throw new Error('Expected a DataTrackReceiver');
+        }if (_this4._trackPriorityPromise !== trackPriorityPromise) {
+          return;
+        }
+
+        // NOTE(mmalavalli): The underlying RTCDataChannel is closed whenever
+        // the VMS instance fails over, and a new RTCDataChannel is created in order
+        // to resume sending Track Priority updates.
+        receiver.once('close', function () {
+          return _this4._teardownTrackPrioritySignaling();
+        });
+
+        _this4._trackPrioritySignaling = new _this4._TrackPrioritySignaling(receiver.toDataTransport());
+        [].concat(_toConsumableArray(_this4.participants.values())).forEach(function (participant) {
+          participant.setTrackPrioritySignaling(_this4._trackPrioritySignaling);
+        });
+      });
+      this._trackPriorityPromise = trackPriorityPromise;
+    }
+  }, {
+    key: '_setupTrackSwitchOff',
+    value: function _setupTrackSwitchOff(trackSwitchOffSignaling) {
+      var _this5 = this;
+
+      this._trackSwitchOffSignaling = trackSwitchOffSignaling;
+      trackSwitchOffSignaling.on('updated', function (tracksOff, tracksOn) {
+        _this5.participants.forEach(function (participant) {
+          participant.tracks.forEach(function (track) {
+            if (tracksOff.includes(track.sid)) {
+              track.setSwitchedOff(true);
+            }
+            if (tracksOn.includes(track.sid)) {
+              track.setSwitchedOff(false);
+            }
+          });
+        });
+      });
+    }
+  }, {
+    key: '_setupTrackSwitchOffMonitor',
+    value: function _setupTrackSwitchOffMonitor(id) {
+      var _this6 = this;
+
+      this._teardownTrackSwitchOff();
+      var trackSwitchOffPromise = this._getTrackReceiver(id).then(function (receiver) {
+        if (receiver.kind !== 'data') {
+          throw new Error('Expected a DataTrackReceiver');
+        }if (_this6._trackSwitchOffPromise !== trackSwitchOffPromise) {
+          return;
+        }
+
+        // NOTE(mpatwardhan): The underlying RTCDataChannel is closed whenever
+        // the VMS instance fails over, and a new RTCDataChannel is created in order
+        // to resume sending Dominant Speaker updates.
+        receiver.once('close', function () {
+          return _this6._teardownTrackSwitchOff();
+        });
+
+        var trackSwitchOffSignaling = new _this6._TrackSwitchOffSignaling(receiver.toDataTransport());
+        _this6._setupTrackSwitchOff(trackSwitchOffSignaling);
+      });
+      this._trackSwitchOffPromise = trackSwitchOffPromise;
     }
 
     /**
@@ -15335,13 +17797,13 @@ var RoomV2 = function (_RoomSignaling) {
   }, {
     key: '_setupDataTransportBackedDominantSpeakerSignaling',
     value: function _setupDataTransportBackedDominantSpeakerSignaling(id) {
-      var _this4 = this;
+      var _this7 = this;
 
       this._teardownDominantSpeakerSignaling();
       var dominantSpeakerSignalingPromise = this._getTrackReceiver(id).then(function (receiver) {
         if (receiver.kind !== 'data') {
           throw new Error('Expected a DataTrackReceiver');
-        }if (_this4._dominantSpeakerSignalingPromise !== dominantSpeakerSignalingPromise) {
+        }if (_this7._dominantSpeakerSignalingPromise !== dominantSpeakerSignalingPromise) {
           // NOTE(mroberts): _teardownDominantSpeakerSignaling was called.
           return;
         }
@@ -15350,11 +17812,11 @@ var RoomV2 = function (_RoomSignaling) {
         // the VMS instance fails over, and a new RTCDataChannel is created in order
         // to resume sending Dominant Speaker updates.
         receiver.once('close', function () {
-          return _this4._teardownDominantSpeakerSignaling();
+          return _this7._teardownDominantSpeakerSignaling();
         });
 
-        var dominantSpeakerSignaling = new _this4._DominantSpeakerSignaling(receiver.toDataTransport());
-        _this4._setDominantSpeakerSignaling(dominantSpeakerSignaling);
+        var dominantSpeakerSignaling = new _this7._DominantSpeakerSignaling(receiver.toDataTransport());
+        _this7._setDominantSpeakerSignaling(dominantSpeakerSignaling);
       });
       this._dominantSpeakerSignalingPromise = dominantSpeakerSignalingPromise;
     }
@@ -15370,14 +17832,14 @@ var RoomV2 = function (_RoomSignaling) {
   }, {
     key: '_setupDataTransportBackedNetworkQualityMonitor',
     value: function _setupDataTransportBackedNetworkQualityMonitor(id) {
-      var _this5 = this;
+      var _this8 = this;
 
       var self = this;
       this._teardownNetworkQualityMonitor();
       var networkQualityMonitorPromise = this._getTrackReceiver(id).then(function (receiver) {
         if (receiver.kind !== 'data') {
           throw new Error('Expected a DataTrackReceiver');
-        }if (_this5._networkQualityMonitorPromise !== networkQualityMonitorPromise) {
+        }if (_this8._networkQualityMonitorPromise !== networkQualityMonitorPromise) {
           // NOTE(mroberts): _teardownNetworkQualityMonitor was called.
           return;
         }
@@ -15386,37 +17848,37 @@ var RoomV2 = function (_RoomSignaling) {
         // the VMS instance fails over, and new a RTCDataChannel is created in order
         // to resume exchanging Network Quality messages.
         receiver.once('close', function () {
-          return _this5._teardownNetworkQualityMonitor();
+          return _this8._teardownNetworkQualityMonitor();
         });
 
-        var networkQualitySignaling = new _this5._NetworkQualitySignaling(receiver.toDataTransport(), self._networkQualityConfiguration);
-        var networkQualityMonitor = new _this5._NetworkQualityMonitor(_this5._peerConnectionManager, networkQualitySignaling);
-        _this5._setNetworkQualityMonitor(networkQualityMonitor);
+        var networkQualitySignaling = new _this8._NetworkQualitySignaling(receiver.toDataTransport(), self._networkQualityConfiguration);
+        var networkQualityMonitor = new _this8._NetworkQualityMonitor(_this8._peerConnectionManager, networkQualitySignaling);
+        _this8._setNetworkQualityMonitor(networkQualityMonitor);
       });
       this._networkQualityMonitorPromise = networkQualityMonitorPromise;
     }
   }, {
     key: '_setDominantSpeakerSignaling',
     value: function _setDominantSpeakerSignaling(dominantSpeakerSignaling) {
-      var _this6 = this;
+      var _this9 = this;
 
       this._dominantSpeakerSignaling = dominantSpeakerSignaling;
       dominantSpeakerSignaling.on('updated', function () {
-        return _this6.setDominantSpeaker(dominantSpeakerSignaling.loudestParticipantSid);
+        return _this9.setDominantSpeaker(dominantSpeakerSignaling.loudestParticipantSid);
       });
     }
   }, {
     key: '_setNetworkQualityMonitor',
     value: function _setNetworkQualityMonitor(networkQualityMonitor) {
-      var _this7 = this;
+      var _this10 = this;
 
       this._networkQualityMonitor = networkQualityMonitor;
       networkQualityMonitor.on('updated', function () {
-        if (_this7.mediaConnectionState === 'failed') {
+        if (_this10.iceConnectionState === 'failed') {
           return;
         }
-        _this7.localParticipant.setNetworkQualityLevel(networkQualityMonitor.level, networkQualityMonitor.levels);
-        _this7.participants.forEach(function (participant) {
+        _this10.localParticipant.setNetworkQualityLevel(networkQualityMonitor.level, networkQualityMonitor.levels);
+        _this10.participants.forEach(function (participant) {
           var levels = networkQualityMonitor.remoteLevels.get(participant.sid);
           if (levels) {
             participant.setNetworkQualityLevel(levels.level, levels);
@@ -15440,6 +17902,22 @@ var RoomV2 = function (_RoomSignaling) {
         this._networkQualityMonitor = null;
       }
     }
+  }, {
+    key: '_teardownTrackPrioritySignaling',
+    value: function _teardownTrackPrioritySignaling() {
+      this._trackPrioritySignaling = null;
+      this._trackPriorityPromise = null;
+      this.localParticipant.setTrackPrioritySignaling(null);
+      this.participants.forEach(function (participant) {
+        participant.setTrackPrioritySignaling(null);
+      });
+    }
+  }, {
+    key: '_teardownTrackSwitchOff',
+    value: function _teardownTrackSwitchOff() {
+      this._trackSwitchOffSignaling = null;
+      this._trackSwitchOffPromise = null;
+    }
 
     /**
      * Get the {@link RoomV2}'s media statistics.
@@ -15449,7 +17927,7 @@ var RoomV2 = function (_RoomSignaling) {
   }, {
     key: 'getStats',
     value: function getStats() {
-      var _this8 = this;
+      var _this11 = this;
 
       return this._peerConnectionManager.getStats().then(function (responses) {
         return new Map(Array.from(responses).map(function (_ref) {
@@ -15458,14 +17936,25 @@ var RoomV2 = function (_RoomSignaling) {
               response = _ref2[1];
 
           return [id, Object.assign({}, response, {
-            localAudioTrackStats: filterAndAddLocalTrackSids(_this8, response.localAudioTrackStats),
-            localVideoTrackStats: filterAndAddLocalTrackSids(_this8, response.localVideoTrackStats),
-            remoteAudioTrackStats: filterAndAddRemoteTrackSids(_this8, response.remoteAudioTrackStats),
-            remoteVideoTrackStats: filterAndAddRemoteTrackSids(_this8, response.remoteVideoTrackStats)
+            localAudioTrackStats: filterAndAddLocalTrackSids(_this11, response.localAudioTrackStats),
+            localVideoTrackStats: filterAndAddLocalTrackSids(_this11, response.localVideoTrackStats),
+            remoteAudioTrackStats: filterAndAddRemoteTrackSids(_this11, response.remoteAudioTrackStats),
+            remoteVideoTrackStats: filterAndAddRemoteTrackSids(_this11, response.remoteVideoTrackStats)
           })];
         }));
       });
     }
+  }, {
+    key: 'connectionState',
+    get: function get() {
+      return this._peerConnectionManager.connectionState;
+    }
+
+    /**
+     * The Signaling Connection State.
+     * @property {string} - "connected", "reconnecting", "disconnected"
+     */
+
   }, {
     key: 'signalingConnectionState',
     get: function get() {
@@ -15473,12 +17962,12 @@ var RoomV2 = function (_RoomSignaling) {
     }
 
     /**
-     * The Media Connection State
+     * The Ice Connection State.
      * @property {RTCIceConnectionState}
      */
 
   }, {
-    key: 'mediaConnectionState',
+    key: 'iceConnectionState',
     get: function get() {
       return this._peerConnectionManager.iceConnectionState;
     }
@@ -15543,15 +18032,15 @@ function filterAndAddRemoteTrackSids(roomV2, remoteTrackStats) {
  */
 
 function handleLocalParticipantEvents(roomV2, localParticipant) {
-  var renegotiate = util.oncePerTick(function () {
-    var trackSenders = util.flatMap(localParticipant.tracks, function (trackV2) {
+  var localParticipantUpdated = oncePerTick(function () {
+    roomV2._publishNewLocalParticipantState();
+  });
+
+  var renegotiate = oncePerTick(function () {
+    var trackSenders = flatMap(localParticipant.tracks, function (trackV2) {
       return trackV2.trackTransceiver;
     });
     roomV2._peerConnectionManager.setTrackSenders(trackSenders);
-  });
-
-  var localParticipantUpdated = util.oncePerTick(function () {
-    roomV2._publishNewLocalParticipantState();
   });
 
   localParticipant.on('trackAdded', renegotiate);
@@ -15565,6 +18054,22 @@ function handleLocalParticipantEvents(roomV2, localParticipant) {
       localParticipant.removeListener('updated', localParticipantUpdated);
       roomV2.removeListener('stateChanged', stateChanged);
       localParticipant.disconnect();
+    }
+  });
+
+  roomV2.on('signalingConnectionStateChanged', function () {
+    var localParticipant = roomV2.localParticipant,
+        signalingConnectionState = roomV2.signalingConnectionState;
+    var identity = localParticipant.identity,
+        sid = localParticipant.sid;
+
+    switch (signalingConnectionState) {
+      case 'connected':
+        localParticipant.connect(sid, identity);
+        break;
+      case 'reconnecting':
+        localParticipant.reconnecting();
+        break;
     }
   });
 }
@@ -15584,9 +18089,13 @@ function handlePeerConnectionEvents(roomV2, peerConnectionManager) {
   peerConnectionManager.dequeue('trackAdded');
   peerConnectionManager.getTrackReceivers().forEach(roomV2._addTrackReceiver, roomV2);
 
+  peerConnectionManager.on('connectionStateChanged', function () {
+    roomV2.emit('connectionStateChanged');
+  });
+
   peerConnectionManager.on('iceConnectionStateChanged', function () {
-    roomV2.emit('mediaConnectionStateChanged');
-    if (roomV2.mediaConnectionState === 'failed') {
+    roomV2.emit('iceConnectionStateChanged');
+    if (roomV2.iceConnectionState === 'failed') {
       if (roomV2.localParticipant.networkQualityLevel !== null) {
         roomV2.localParticipant.setNetworkQualityLevel(0);
       }
@@ -15616,11 +18125,10 @@ function handleTransportEvents(roomV2, transport) {
  * Periodically publish {@link StatsReport}s.
  * @private
  * @param {RoomV2} roomV2
- * @param {LocalParticipantV2} localParticipant
  * @param {Transport} transport
  * @param {Number} intervalMs
  */
-function periodicallyPublishStats(roomV2, localParticipant, transport, intervalMs) {
+function periodicallyPublishStats(roomV2, transport, intervalMs) {
   var interval = setInterval(function () {
     roomV2.getStats().then(function (stats) {
       stats.forEach(function (response, id) {
@@ -15633,9 +18141,7 @@ function periodicallyPublishStats(roomV2, localParticipant, transport, intervalM
           audioTrackStats: report.remoteAudioTrackStats,
           localAudioTrackStats: report.localAudioTrackStats,
           localVideoTrackStats: report.localVideoTrackStats,
-          participantSid: localParticipant.sid,
           peerConnectionId: report.peerConnectionId,
-          roomSid: roomV2.sid,
           videoTrackStats: report.remoteVideoTrackStats
         });
 
@@ -15660,21 +18166,17 @@ function periodicallyPublishStats(roomV2, localParticipant, transport, intervalM
 }
 
 function handleSubscriptions(room) {
-  var trackSignalings = new Map(util.flatMap(room.participants, function (participant) {
-    return Array.from(participant.tracks.values()).map(function (track) {
-      return [track.sid, track];
-    });
-  }));
+  var trackSidsToTrackSignalings = room._getTrackSidsToTrackSignalings();
 
   room._subscriptionFailures.forEach(function (error, trackSid) {
-    var trackSignaling = trackSignalings.get(trackSid);
+    var trackSignaling = trackSidsToTrackSignalings.get(trackSid);
     if (trackSignaling) {
       room._subscriptionFailures.delete(trackSid);
       trackSignaling.subscribeFailed(createTwilioError(error.code, error.message));
     }
   });
 
-  trackSignalings.forEach(function (trackSignaling) {
+  trackSidsToTrackSignalings.forEach(function (trackSignaling) {
     var trackId = room._subscribed.get(trackSignaling.sid);
     if (!trackId || trackSignaling.isSubscribed && trackSignaling.trackTransceiver.id !== trackId) {
       trackSignaling.setTrackTransceiver(null);
@@ -15711,7 +18213,7 @@ function replaceNullsWithDefaults(activeIceCandidatePair, peerConnectionId) {
     totalRoundTripTime: 0,
     transportId: '',
     writable: false
-  }, util.filterObject(activeIceCandidatePair || {}, null));
+  }, filterObject(activeIceCandidatePair || {}, null));
 
   activeIceCandidatePair.localCandidate = Object.assign({
     candidateType: 'host',
@@ -15722,7 +18224,7 @@ function replaceNullsWithDefaults(activeIceCandidatePair, peerConnectionId) {
     protocol: 'udp',
     relayProtocol: 'udp',
     url: ''
-  }, util.filterObject(activeIceCandidatePair.localCandidate || {}, null));
+  }, filterObject(activeIceCandidatePair.localCandidate || {}, null));
 
   activeIceCandidatePair.remoteCandidate = Object.assign({
     candidateType: 'host',
@@ -15731,13 +18233,124 @@ function replaceNullsWithDefaults(activeIceCandidatePair, peerConnectionId) {
     priority: 0,
     protocol: 'udp',
     url: ''
-  }, util.filterObject(activeIceCandidatePair.remoteCandidate || {}, null));
+  }, filterObject(activeIceCandidatePair.remoteCandidate || {}, null));
 
   return activeIceCandidatePair;
 }
 
 module.exports = RoomV2;
-},{"../../stats/statsreport":123,"../../util":132,"../../util/twilio-video-errors":145,"../room":77,"./dominantspeakersignaling":80,"./networkqualitymonitor":86,"./networkqualitysignaling":87,"./recording":90,"./remoteparticipant":91}],94:[function(require,module,exports){
+},{"../../stats/statsreport":135,"../../util":144,"../../util/twilio-video-errors":157,"../room":87,"./dominantspeakersignaling":90,"./networkqualitymonitor":96,"./networkqualitysignaling":97,"./recording":100,"./remoteparticipant":101,"./trackprioritysignaling":104,"./trackswitchoffsignaling":105}],104:[function(require,module,exports){
+'use strict';
+
+var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
+
+function _defineProperty(obj, key, value) { if (key in obj) { Object.defineProperty(obj, key, { value: value, enumerable: true, configurable: true, writable: true }); } else { obj[key] = value; } return obj; }
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+var TrackPrioritySignaling = function () {
+  /**
+   * Construct a {@link TrackPrioritySignaling}.
+   * @param {MediaSignalingTransport} mediaSignalingTransport
+   */
+  function TrackPrioritySignaling(mediaSignalingTransport) {
+    _classCallCheck(this, TrackPrioritySignaling);
+
+    Object.defineProperties(this, {
+      _mediaSignalingTransport: {
+        value: mediaSignalingTransport
+      }
+    });
+  }
+
+  /**
+   * @param {Track.SID} trackSid
+   * @param {'publish'|'subscribe'} publishOrSubscribe
+   * @param {Track.Priority} priority
+   */
+
+
+  _createClass(TrackPrioritySignaling, [{
+    key: 'sendTrackPriorityUpdate',
+    value: function sendTrackPriorityUpdate(trackSid, publishOrSubscribe, priority) {
+      this._mediaSignalingTransport.publish(_defineProperty({
+        type: 'track_priority',
+        track: trackSid
+      }, publishOrSubscribe, priority));
+    }
+  }]);
+
+  return TrackPrioritySignaling;
+}();
+
+module.exports = TrackPrioritySignaling;
+},{}],105:[function(require,module,exports){
+'use strict';
+
+var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
+
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
+
+var _require = require('events'),
+    EventEmitter = _require.EventEmitter;
+
+/**
+ * @emits TrackSwitchOffSignalinging#updated
+ */
+
+
+var TrackSwitchOffSignaling = function (_EventEmitter) {
+  _inherits(TrackSwitchOffSignaling, _EventEmitter);
+
+  /**
+   * Construct a {@link TrackSwitchOffSignaling}.
+   * @param {MediaSignalingTransport} mediaSignalingTransport
+   */
+  function TrackSwitchOffSignaling(mediaSignalingTransport) {
+    _classCallCheck(this, TrackSwitchOffSignaling);
+
+    var _this = _possibleConstructorReturn(this, (TrackSwitchOffSignaling.__proto__ || Object.getPrototypeOf(TrackSwitchOffSignaling)).call(this));
+
+    mediaSignalingTransport.on('message', function (message) {
+      switch (message.type) {
+        case 'track_switch_off':
+          _this._setTrackSwitchOffUpdates(message.off || [], message.on || []);
+          break;
+        default:
+          break;
+      }
+    });
+    return _this;
+  }
+
+  /**
+   * @private
+   * @param {[Track.SID]} tracksSwitchedOff
+   * @param {[Track.SID]} tracksSwitchedOn
+   * @returns {void}
+   */
+
+
+  _createClass(TrackSwitchOffSignaling, [{
+    key: '_setTrackSwitchOffUpdates',
+    value: function _setTrackSwitchOffUpdates(tracksSwitchedOff, tracksSwitchedOn) {
+      this.emit('updated', tracksSwitchedOff, tracksSwitchedOn);
+    }
+  }]);
+
+  return TrackSwitchOffSignaling;
+}(EventEmitter);
+
+/**
+ * @event TrackSwitchOffSignaling#updated
+ */
+
+module.exports = TrackSwitchOffSignaling;
+},{"events":168}],106:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -15756,21 +18369,24 @@ var InsightsPublisher = require('../../util/insightspublisher');
 var NullInsightsPublisher = require('../../util/insightspublisher/null');
 var StateMachine = require('../../statemachine');
 var TwilioConnection = require('../../twilioconnection');
+var DefaultBackoff = require('backoff');
 
-var _require2 = require('../../util'),
-    createMediaSignalingPayload = _require2.createMediaSignalingPayload,
-    createSubscribePayload = _require2.createSubscribePayload,
-    getUserAgent = _require2.getUserAgent,
-    withJitter = _require2.withJitter;
+var _require2 = require('../../util/constants'),
+    reconnectBackoffConfig = _require2.reconnectBackoffConfig;
 
-var _require3 = require('../../util/twilio-video-errors'),
-    createTwilioError = _require3.createTwilioError,
-    RoomCompletedError = _require3.RoomCompletedError,
-    SignalingConnectionError = _require3.SignalingConnectionError;
+var Timeout = require('../../util/timeout');
 
-var MAX_RECONNECT_ATTEMPTS = 5;
-var RECONNECT_BACKOFF_JITTER = 100;
-var RECONNECT_BACKOFF_MS = 100;
+var _require3 = require('../../util'),
+    createBandwidthProfilePayload = _require3.createBandwidthProfilePayload,
+    createMediaSignalingPayload = _require3.createMediaSignalingPayload,
+    createSubscribePayload = _require3.createSubscribePayload,
+    getUserAgent = _require3.getUserAgent;
+
+var _require4 = require('../../util/twilio-video-errors'),
+    createTwilioError = _require4.createTwilioError,
+    RoomCompletedError = _require4.RoomCompletedError,
+    SignalingConnectionError = _require4.SignalingConnectionError;
+
 var RSP_VERSION = 2;
 var SDK_NAME = packageInfo.name + '.js';
 var SDK_VERSION = packageInfo.version;
@@ -15830,13 +18446,13 @@ var TwilioConnectionTransport = function (_StateMachine) {
     _classCallCheck(this, TwilioConnectionTransport);
 
     options = Object.assign({
+      Backoff: DefaultBackoff,
       InsightsPublisher: InsightsPublisher,
       NullInsightsPublisher: NullInsightsPublisher,
       TwilioConnection: TwilioConnection,
-      maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
-      reconnectBackOffJitter: RECONNECT_BACKOFF_JITTER,
-      reconnectBackOffMs: RECONNECT_BACKOFF_MS,
       sdpFormat: getSdpFormat(options.sdpSemantics),
+      trackPriority: true,
+      trackSwitchOff: true,
       userAgent: getUserAgent()
     }, options);
 
@@ -15854,6 +18470,9 @@ var TwilioConnectionTransport = function (_StateMachine) {
       },
       _automaticSubscription: {
         value: options.automaticSubscription
+      },
+      _bandwidthProfile: {
+        value: options.bandwidthProfile
       },
       _dominantSpeaker: {
         value: options.dominantSpeaker
@@ -15879,19 +18498,26 @@ var TwilioConnectionTransport = function (_StateMachine) {
       _peerConnectionManager: {
         value: peerConnectionManager
       },
-      _reconnectAttemptsLeft: {
-        value: options.maxReconnectAttempts,
+      _sessionTimer: {
+        value: null,
         writable: true
       },
-      _reconnectBackOffJitter: {
-        value: options.reconnectBackOffJitter
+      _sessionTimeoutMS: {
+        value: 0, // initially 0, set only after 1st successful connection.
+        writable: true
       },
-      _reconnectBackOffMs: {
-        value: options.reconnectBackOffMs
+      _reconnectBackoff: {
+        value: options.Backoff.exponential(reconnectBackoffConfig)
       },
       _session: {
         value: null,
         writable: true
+      },
+      _trackPriority: {
+        value: options.trackPriority
+      },
+      _trackSwitchOff: {
+        value: options.trackSwitchOff
       },
       _twilioConnection: {
         value: null,
@@ -15911,6 +18537,13 @@ var TwilioConnectionTransport = function (_StateMachine) {
       }
     });
     setupEventListeners(_this);
+
+    _this.once('connected', function (_ref) {
+      var sid = _ref.sid,
+          participant = _ref.participant;
+
+      _this._eventPublisher.connect(sid, participant.sid);
+    });
     return _this;
   }
 
@@ -15958,7 +18591,11 @@ var TwilioConnectionTransport = function (_StateMachine) {
           user_agent: this._userAgent
         };
 
-        message.media_signaling = createMediaSignalingPayload(this._dominantSpeaker, this._networkQuality);
+        if (this._bandwidthProfile) {
+          message.bandwidth_profile = createBandwidthProfilePayload(this._bandwidthProfile);
+        }
+
+        message.media_signaling = createMediaSignalingPayload(this._dominantSpeaker, this._networkQuality, this._trackPriority, this._trackSwitchOff);
 
         message.subscribe = createSubscribePayload(this._automaticSubscription);
 
@@ -16054,6 +18691,73 @@ var TwilioConnectionTransport = function (_StateMachine) {
       }
       return false;
     }
+
+    /**
+     * @returns {void}
+     */
+
+  }, {
+    key: '_setSession',
+    value: function _setSession(session, sessionTimeout) {
+      this._session = session;
+      this._sessionTimeoutMS = sessionTimeout * 1000;
+    }
+
+    /**
+     * Determines if we should attempt reconnect.
+     * returns a Promise to wait on before attempting to
+     * reconnect. returns null if its not okay to reconnect.
+     * @private
+     * @returns {Promise<void>}
+     */
+
+  }, {
+    key: '_getReconnectTimer',
+    value: function _getReconnectTimer() {
+      var _this2 = this;
+
+      if (this._sessionTimeoutMS === 0) {
+        // this means either we have never connected.
+        // or we timed out while trying to reconnect
+        // In either case we do not want to reconnect.
+        return null;
+      }
+
+      // start session timer
+      if (!this._sessionTimer) {
+        this._sessionTimer = new Timeout(function () {
+          // ensure that _clearReconnectTimer wasn't
+          // called while we were waiting.
+          if (_this2._sessionTimer) {
+            // do not allow any more reconnect attempts.
+            _this2._sessionTimeoutMS = 0;
+          }
+        }, this._sessionTimeoutMS);
+      }
+
+      // return promise that waits with exponential backoff.
+      return new Promise(function (resolve) {
+        _this2._reconnectBackoff.once('ready', resolve);
+        _this2._reconnectBackoff.backoff();
+      });
+    }
+
+    /**
+     * clears the session reconnect timer.
+     *
+     * @private
+     * @returns {void}
+     */
+
+  }, {
+    key: '_clearReconnectTimer',
+    value: function _clearReconnectTimer() {
+      this._reconnectBackoff.reset();
+      if (this._sessionTimer) {
+        this._sessionTimer.clear();
+        this._sessionTimer = null;
+      }
+    }
   }]);
 
   return TwilioConnectionTransport;
@@ -16144,29 +18848,18 @@ function setupEventListeners(transport) {
       transport.disconnect();
       return;
     }
-    if (transport._reconnectAttemptsLeft <= 0) {
+
+    var reconnectTimer = transport._getReconnectTimer();
+    if (!reconnectTimer) {
       transport.disconnect(new SignalingConnectionError());
       return;
     }
-    reconnect();
-  }
 
-  function reconnect() {
     if (transport.state === 'connected') {
       transport.preempt('syncing');
     }
-    transport._reconnectAttemptsLeft--;
-    var maxReconnectAttempts = transport._options.maxReconnectAttempts;
 
-    var reconnectAttempts = maxReconnectAttempts - transport._reconnectAttemptsLeft;
-    var backOffMs = (1 << reconnectAttempts) * transport._reconnectBackOffMs;
-    setTimeout(startConnect, withJitter(backOffMs, transport._reconnectBackOffJitter));
-  }
-
-  function resetReconnectAttemptsLeft() {
-    var maxReconnectAttempts = transport._options.maxReconnectAttempts;
-
-    transport._reconnectAttemptsLeft = maxReconnectAttempts;
+    reconnectTimer.then(startConnect);
   }
 
   function startConnect() {
@@ -16205,7 +18898,7 @@ function setupEventListeners(transport) {
       case 'connecting':
         switch (message.type) {
           case 'connected':
-            transport._session = message.session;
+            transport._setSession(message.session, message.options.session_timeout);
             transport.emit('connected', message);
             transport.preempt('connected');
             return;
@@ -16227,7 +18920,7 @@ function setupEventListeners(transport) {
             transport._updatesReceived.push(message);
             return;
           case 'synced':
-            resetReconnectAttemptsLeft();
+            transport._clearReconnectTimer();
             transport.emit('message', message);
             transport.preempt('connected');
             return;
@@ -16274,7 +18967,7 @@ function setupEventListeners(transport) {
 }
 
 module.exports = TwilioConnectionTransport;
-},{"../../../package.json":150,"../../statemachine":95,"../../twilioconnection":127,"../../util":132,"../../util/insightspublisher":133,"../../util/insightspublisher/null":134,"../../util/twilio-video-errors":145,"@twilio/webrtc/lib/util/sdp":18}],95:[function(require,module,exports){
+},{"../../../package.json":163,"../../statemachine":107,"../../twilioconnection":139,"../../util":144,"../../util/constants":142,"../../util/insightspublisher":145,"../../util/insightspublisher/null":146,"../../util/timeout":155,"../../util/twilio-video-errors":157,"@twilio/webrtc/lib/util/sdp":18,"backoff":20}],107:[function(require,module,exports){
 'use strict';
 
 var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
@@ -16776,7 +19469,7 @@ function createUnreachableError(here, there) {
 }
 
 module.exports = StateMachine;
-},{"./util":132,"events":155}],96:[function(require,module,exports){
+},{"./util":144,"events":168}],108:[function(require,module,exports){
 /* eslint no-undefined:0 */
 'use strict';
 
@@ -16795,7 +19488,7 @@ function average(xs) {
 }
 
 module.exports = average;
-},{}],97:[function(require,module,exports){
+},{}],109:[function(require,module,exports){
 'use strict';
 
 /**
@@ -16866,7 +19559,7 @@ var IceReport = function () {
 }();
 
 module.exports = IceReport;
-},{}],98:[function(require,module,exports){
+},{}],110:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -16925,7 +19618,7 @@ var IceReportFactory = function () {
 }();
 
 module.exports = IceReportFactory;
-},{"./icereport":97}],99:[function(require,module,exports){
+},{"./icereport":109}],111:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -16978,7 +19671,7 @@ var LocalAudioTrackStats = function (_LocalTrackStats) {
  */
 
 module.exports = LocalAudioTrackStats;
-},{"./localtrackstats":100}],100:[function(require,module,exports){
+},{"./localtrackstats":112}],112:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -17030,7 +19723,7 @@ var LocalTrackStats = function (_TrackStats) {
 }(TrackStats);
 
 module.exports = LocalTrackStats;
-},{"./trackstats":125}],101:[function(require,module,exports){
+},{"./trackstats":137}],113:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -17119,7 +19812,7 @@ var LocalVideoTrackStats = function (_LocalTrackStats) {
 }(LocalTrackStats);
 
 module.exports = LocalVideoTrackStats;
-},{"./localtrackstats":100}],102:[function(require,module,exports){
+},{"./localtrackstats":112}],114:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -17151,7 +19844,7 @@ var NetworkQualityAudioStats = function (_NetworkQualityMediaS) {
 }(NetworkQualityMediaStats);
 
 module.exports = NetworkQualityAudioStats;
-},{"./networkqualitymediastats":106}],103:[function(require,module,exports){
+},{"./networkqualitymediastats":118}],115:[function(require,module,exports){
 'use strict';
 
 /**
@@ -17195,7 +19888,7 @@ function NetworkQualityBandwidthStats(_ref) {
 };
 
 module.exports = NetworkQualityBandwidthStats;
-},{}],104:[function(require,module,exports){
+},{}],116:[function(require,module,exports){
 'use strict';
 
 /**
@@ -17232,7 +19925,7 @@ function NetworkQualityFractionLostStats(_ref) {
 };
 
 module.exports = NetworkQualityFractionLostStats;
-},{}],105:[function(require,module,exports){
+},{}],117:[function(require,module,exports){
 'use strict';
 
 /**
@@ -17276,7 +19969,7 @@ function NetworkQualityLatencyStats(_ref) {
 };
 
 module.exports = NetworkQualityLatencyStats;
-},{}],106:[function(require,module,exports){
+},{}],118:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -17334,7 +20027,7 @@ function NetworkQualityMediaStats(_ref) {
 };
 
 module.exports = NetworkQualityMediaStats;
-},{"./networkqualityrecvstats":107,"./networkqualitysendstats":109}],107:[function(require,module,exports){
+},{"./networkqualityrecvstats":119,"./networkqualitysendstats":121}],119:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -17367,7 +20060,7 @@ var NetworkQualityRecvStats = function (_NetworkQualitySendOr) {
 }(NetworkQualitySendOrRecvStats);
 
 module.exports = NetworkQualityRecvStats;
-},{"./networkqualitysendorrecvstats":108}],108:[function(require,module,exports){
+},{"./networkqualitysendorrecvstats":120}],120:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -17418,7 +20111,7 @@ function NetworkQualitySendOrRecvStats(_ref) {
 };
 
 module.exports = NetworkQualitySendOrRecvStats;
-},{"./networkqualitybandwidthstats":103,"./networkqualityfractionloststats":104,"./networkqualitylatencystats":105}],109:[function(require,module,exports){
+},{"./networkqualitybandwidthstats":115,"./networkqualityfractionloststats":116,"./networkqualitylatencystats":117}],121:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -17451,7 +20144,7 @@ var NetworkQualitySendStats = function (_NetworkQualitySendOr) {
 }(NetworkQualitySendOrRecvStats);
 
 module.exports = NetworkQualitySendStats;
-},{"./networkqualitysendorrecvstats":108}],110:[function(require,module,exports){
+},{"./networkqualitysendorrecvstats":120}],122:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -17499,7 +20192,7 @@ function NetworkQualityStats(_ref) {
 };
 
 module.exports = NetworkQualityStats;
-},{"./networkqualityaudiostats":102,"./networkqualityvideostats":111}],111:[function(require,module,exports){
+},{"./networkqualityaudiostats":114,"./networkqualityvideostats":123}],123:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -17531,7 +20224,7 @@ var NetworkQualityVideoStats = function (_NetworkQualityMediaS) {
 }(NetworkQualityMediaStats);
 
 module.exports = NetworkQualityVideoStats;
-},{"./networkqualitymediastats":106}],112:[function(require,module,exports){
+},{"./networkqualitymediastats":118}],124:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -17630,7 +20323,7 @@ var PeerConnectionReport = function () {
 }();
 
 module.exports = PeerConnectionReport;
-},{"./receiverreport":114,"./senderreport":121}],113:[function(require,module,exports){
+},{"./receiverreport":126,"./senderreport":133}],125:[function(require,module,exports){
 'use strict';
 
 var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }();
@@ -18158,7 +20851,7 @@ function updateChrome(factory) {
 }
 
 module.exports = PeerConnectionReportFactory;
-},{"./icereportfactory":98,"./peerconnectionreport":112,"./receiverreportfactory":115,"./senderreportfactory":122}],114:[function(require,module,exports){
+},{"./icereportfactory":110,"./peerconnectionreport":124,"./receiverreportfactory":127,"./senderreportfactory":134}],126:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -18306,7 +20999,7 @@ var ReceiverReport = function (_SenderOrReceiverRepo) {
 }(SenderOrReceiverReport);
 
 module.exports = ReceiverReport;
-},{"./average":96,"./senderorreceiverreport":119,"./sum":124}],115:[function(require,module,exports){
+},{"./average":108,"./senderorreceiverreport":131,"./sum":136}],127:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -18372,7 +21065,7 @@ var ReceiverReportFactory = function (_SenderOrReceiverRepo) {
 }(SenderOrReceiverReportFactory);
 
 module.exports = ReceiverReportFactory;
-},{"./receiverreport":114,"./senderorreceiverreportfactory":120}],116:[function(require,module,exports){
+},{"./receiverreport":126,"./senderorreceiverreportfactory":132}],128:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -18419,7 +21112,7 @@ var RemoteAudioTrackStats = function (_RemoteTrackStats) {
 }(RemoteTrackStats);
 
 module.exports = RemoteAudioTrackStats;
-},{"./remotetrackstats":117}],117:[function(require,module,exports){
+},{"./remotetrackstats":129}],129:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -18466,7 +21159,7 @@ var RemoteTrackStats = function (_TrackStats) {
 }(TrackStats);
 
 module.exports = RemoteTrackStats;
-},{"./trackstats":125}],118:[function(require,module,exports){
+},{"./trackstats":137}],130:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -18529,7 +21222,7 @@ var RemoteVideoTrackStats = function (_RemoteTrackStats) {
 }(RemoteTrackStats);
 
 module.exports = RemoteVideoTrackStats;
-},{"./remotetrackstats":117}],119:[function(require,module,exports){
+},{"./remotetrackstats":129}],131:[function(require,module,exports){
 'use strict';
 
 /**
@@ -18567,7 +21260,7 @@ function SenderOrReceiverReport(id, trackId, bitrate) {
 };
 
 module.exports = SenderOrReceiverReport;
-},{}],120:[function(require,module,exports){
+},{}],132:[function(require,module,exports){
 'use strict';
 
 /**
@@ -18607,7 +21300,7 @@ function SenderOrReceiverReportFactory(id, trackId, initialStats) {
 };
 
 module.exports = SenderOrReceiverReportFactory;
-},{}],121:[function(require,module,exports){
+},{}],133:[function(require,module,exports){
 /* eslint no-undefined:0 */
 'use strict';
 
@@ -18707,7 +21400,7 @@ var SenderReport = function (_SenderOrReceiverRepo) {
 }(SenderOrReceiverReport);
 
 module.exports = SenderReport;
-},{"./average":96,"./senderorreceiverreport":119,"./sum":124}],122:[function(require,module,exports){
+},{"./average":108,"./senderorreceiverreport":131,"./sum":136}],134:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -18773,7 +21466,7 @@ var SenderReportFactory = function (_SenderOrReceiverRepo) {
 }(SenderOrReceiverReportFactory);
 
 module.exports = SenderReportFactory;
-},{"./senderorreceiverreportfactory":120,"./senderreport":121}],123:[function(require,module,exports){
+},{"./senderorreceiverreportfactory":132,"./senderreport":133}],135:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -18837,7 +21530,7 @@ function StatsReport(peerConnectionId, statsResponse) {
 };
 
 module.exports = StatsReport;
-},{"./localaudiotrackstats":99,"./localvideotrackstats":101,"./remoteaudiotrackstats":116,"./remotevideotrackstats":118}],124:[function(require,module,exports){
+},{"./localaudiotrackstats":111,"./localvideotrackstats":113,"./remoteaudiotrackstats":128,"./remotevideotrackstats":130}],136:[function(require,module,exports){
 'use strict';
 
 /**
@@ -18852,7 +21545,7 @@ function sum(xs) {
 }
 
 module.exports = sum;
-},{}],125:[function(require,module,exports){
+},{}],137:[function(require,module,exports){
 'use strict';
 
 /**
@@ -18912,7 +21605,7 @@ function TrackStats(trackId, statsReport) {
 };
 
 module.exports = TrackStats;
-},{}],126:[function(require,module,exports){
+},{}],138:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -18982,7 +21675,7 @@ var TrackTransceiver = function (_EventEmitter) {
  */
 
 module.exports = TrackTransceiver;
-},{"events":155}],127:[function(require,module,exports){
+},{"events":168}],139:[function(require,module,exports){
 (function (global){
 'use strict';
 
@@ -19514,7 +22207,7 @@ var TwilioConnection = function (_StateMachine) {
 
 module.exports = TwilioConnection;
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./statemachine":95,"./util":132,"./util/log":135,"./util/timeout":143,"ws":151}],128:[function(require,module,exports){
+},{"./statemachine":107,"./util":144,"./util/log":147,"./util/timeout":155,"ws":164}],140:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -19602,7 +22295,7 @@ var AsyncVar = function () {
 }();
 
 module.exports = AsyncVar;
-},{"./":132}],129:[function(require,module,exports){
+},{"./":144}],141:[function(require,module,exports){
 'use strict';
 
 /**
@@ -19750,7 +22443,7 @@ var CancelablePromise = function () {
 }();
 
 module.exports = CancelablePromise;
-},{}],130:[function(require,module,exports){
+},{}],142:[function(require,module,exports){
 'use strict';
 
 module.exports.DEFAULT_ENVIRONMENT = 'prod';
@@ -19758,7 +22451,7 @@ module.exports.DEFAULT_REALM = 'us1';
 module.exports.DEFAULT_REGION = 'gll';
 module.exports.DEFAULT_LOG_LEVEL = 'warn';
 module.exports.WS_SERVER = function (environment, region) {
-  region = region === 'gll' ? 'global' : region;
+  region = region === 'gll' ? 'global' : encodeURIComponent(region);
   return environment === 'prod' ? 'wss://' + region + '.vss.twilio.com/signaling' : 'wss://' + region + '.vss.' + environment + '.twilio.com/signaling';
 };
 module.exports.ECS_SERVER = function (environment, realm) {
@@ -19808,24 +22501,54 @@ module.exports.typeErrors = {
     return new TypeError(name + ' must be ' + article(type) + ' ' + type);
   },
   INVALID_VALUE: function INVALID_VALUE(name, values) {
-    return new RangeError(name + ' must be one of ', values.join(', '));
+    return new RangeError(name + ' must be one of ' + values.join(', '));
   },
   REQUIRED_ARGUMENT: function REQUIRED_ARGUMENT(name) {
     return new TypeError(name + ' must be specified');
   }
 };
 
+module.exports.DEFAULT_ICE_GATHERING_TIMEOUT_MS = 15000;
+module.exports.DEFAULT_SESSION_TIMEOUT_SEC = 30;
+
 module.exports.DEFAULT_NQ_LEVEL_LOCAL = 1;
 module.exports.DEFAULT_NQ_LEVEL_REMOTE = 0;
 module.exports.MAX_NQ_LEVEL = 3;
 
-// TODO(mmalavalli): Once we decide to support Unified Plan on Chrome 72+,
-// we need to remove this constant and its references.
-module.exports.DEFAULT_CHROME_SDP_SEMANTICS = 'plan-b';
-
 module.exports.ICE_ACTIVITY_CHECK_PERIOD_MS = 1000;
 module.exports.ICE_INACTIVITY_THRESHOLD_MS = 3000;
-},{}],131:[function(require,module,exports){
+
+module.exports.iceRestartBackoffConfig = {
+  factor: 1.1,
+  initialDelay: 1,
+  maxDelay: module.exports.DEFAULT_SESSION_TIMEOUT_SEC * 1000,
+  randomisationFactor: 0.5
+};
+
+module.exports.reconnectBackoffConfig = {
+  factor: 1.5,
+  initialDelay: 80,
+  randomisationFactor: 0.5
+};
+
+module.exports.subscriptionMode = {
+  MODE_COLLABORATION: 'collaboration',
+  MODE_GRID: 'grid',
+  MODE_PRESENTATION: 'presentation'
+};
+
+module.exports.trackSwitchOffMode = {
+  MODE_DISABLED: 'disabled',
+  MODE_DETECTED: 'detected',
+  MODE_PREDICTED: 'predicted'
+};
+
+module.exports.trackPriority = {
+  PRIORITY_HIGH: 'high',
+  PRIORITY_LOW: 'low',
+  PRIORITY_STANDARD: 'standard'
+};
+},{}],143:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -19890,7 +22613,7 @@ var Filter = function () {
 }();
 
 module.exports = Filter;
-},{}],132:[function(require,module,exports){
+},{}],144:[function(require,module,exports){
 'use strict';
 
 var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }();
@@ -19908,6 +22631,10 @@ function _inherits(subClass, superClass) { if (typeof superClass !== "function" 
 function _toConsumableArray(arr) { if (Array.isArray(arr)) { for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) { arr2[i] = arr[i]; } return arr2; } else { return Array.from(arr); } }
 
 var constants = require('./constants');
+var E = constants.typeErrors,
+    trackPriority = constants.trackPriority;
+
+var util = require('@twilio/webrtc/lib/util');
 
 /**
  * Return the given {@link LocalTrack} or a new {@link LocalTrack} for the
@@ -19924,23 +22651,24 @@ function asLocalTrack(track, options) {
   if (track instanceof options.MediaStreamTrack) {
     return track.kind === 'audio' ? new options.LocalAudioTrack(track, options) : new options.LocalVideoTrack(track, options);
   }
-  throw constants.typeErrors.INVALID_TYPE('track', 'LocalAudioTrack, LocalVideoTrack, LocalDataTrack, or MediaStreamTrack');
+  /* eslint new-cap:0 */
+  throw E.INVALID_TYPE('track', 'LocalAudioTrack, LocalVideoTrack, LocalDataTrack, or MediaStreamTrack');
 }
 
 /**
  * Create a new {@link LocalTrackPublication} for the given {@link LocalTrack}.
  * @param {LocalTrack} track
- * @param {string} sid
+ * @param {LocalTrackPublicationSignaling} signaling
  * @param {function(track: LocalTrackPublication): void} unpublish
  * @param {object} options
  */
-function asLocalTrackPublication(track, sid, unpublish, options) {
+function asLocalTrackPublication(track, signaling, unpublish, options) {
   var LocalTrackPublication = {
     audio: options.LocalAudioTrackPublication,
     video: options.LocalVideoTrackPublication,
     data: options.LocalDataTrackPublication
   }[track.kind];
-  return new LocalTrackPublication(sid, track, unpublish, options);
+  return new LocalTrackPublication(signaling, track, unpublish, options);
 }
 
 /**
@@ -20036,6 +22764,10 @@ function getUserAgent() {
   return typeof navigator !== 'undefined' && navigator.userAgent ? navigator.userAgent : 'Unknown';
 }
 
+/**
+ * Create a unique identifier.
+ * @returns {string}
+ */
 function makeUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
     var r = Math.random() * 16 | 0;
@@ -20179,6 +22911,49 @@ function delegateMethods(source, wrapper, target) {
 }
 
 /**
+ * Determine whether two values are deeply equal.
+ * @param {*} val1
+ * @param {*} val2
+ * @returns {boolean}
+ */
+function isDeepEqual(val1, val2) {
+  if (val1 === val2) {
+    return true;
+  }
+  if ((typeof val1 === 'undefined' ? 'undefined' : _typeof(val1)) !== (typeof val2 === 'undefined' ? 'undefined' : _typeof(val2))) {
+    return false;
+  }
+  if (val1 === null) {
+    return val2 === null;
+  }
+  if (val2 === null) {
+    return false;
+  }
+  if (Array.isArray(val1)) {
+    return Array.isArray(val2) && val1.length === val2.length && val1.every(function (val, i) {
+      return isDeepEqual(val, val2[i]);
+    });
+  }
+  if ((typeof val1 === 'undefined' ? 'undefined' : _typeof(val1)) === 'object') {
+    var val1Keys = Object.keys(val1).sort();
+    var val2Keys = Object.keys(val2).sort();
+    return !Array.isArray(val2) && isDeepEqual(val1Keys, val2Keys) && val1Keys.every(function (key) {
+      return isDeepEqual(val1[key], val2[key]);
+    });
+  }
+  return false;
+}
+
+/**
+ * Whether the given argument is a non-array object.
+ * @param {*} object
+ * @return {boolean}
+ */
+function isNonArrayObject(object) {
+  return (typeof object === 'undefined' ? 'undefined' : _typeof(object)) === 'object' && !Array.isArray(object);
+}
+
+/**
  * For each property name on the `source` prototype, add getters and/or setters
  * to `wrapper` that proxy to `target`.
  * @param {object} source
@@ -20289,19 +23064,6 @@ function trackPublicationClass(publication, local) {
 }
 
 /**
- * Throw if the given track is not a {@link LocalAudioTrack}, a
- * {@link LocalVideoTrack} or a MediaStreamTrack.
- * @param {*} track
- * @param {object} options
- */
-function validateLocalTrack(track, options) {
-  if (!(track instanceof options.LocalAudioTrack || track instanceof options.LocalDataTrack || track instanceof options.LocalVideoTrack || track instanceof options.MediaStreamTrack)) {
-    /* eslint new-cap:0 */
-    throw constants.typeErrors.INVALID_TYPE('track', 'LocalAudioTrack, LocalVideoTrack, LocalDataTrack, or MediaStreamTrack');
-  }
-}
-
-/**
  * Sets all underscore-prefixed properties on `object` non-enumerable.
  * @param {Object} object
  * @returns {void}
@@ -20368,6 +23130,7 @@ function hidePublicProperties(object) {
   var props = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : [];
 
   props.forEach(function (name) {
+    // eslint-disable-next-line no-prototype-builtins
     if (object.hasOwnProperty(name)) {
       hideProperty(object, name);
     }
@@ -20445,20 +23208,91 @@ function valueToJSON(value) {
 }
 
 /**
+ * Create the bandwidth profile payload included in an RSP connect message.
+ * @param {BandwidthProfileOptions} bandwidthProfile
+ * @returns {object}
+ */
+function createBandwidthProfilePayload(bandwidthProfile) {
+  return createRSPPayload(bandwidthProfile, [{ prop: 'video', type: 'object', transform: createBandwidthProfileVideoPayload }]);
+}
+
+/**
+ * Create the bandwidth profile video payload included in an RSP connect message.
+ * @param {VideoBandwidthProfileOptions} bandwidthProfileVideo
+ * @returns {object}
+ */
+function createBandwidthProfileVideoPayload(bandwidthProfileVideo) {
+  return createRSPPayload(bandwidthProfileVideo, [{ prop: 'dominantSpeakerPriority', type: 'string', payloadProp: 'active_speaker_priority' }, { prop: 'maxSubscriptionBitrate', type: 'number', payloadProp: 'max_subscription_bandwidth' }, { prop: 'maxTracks', type: 'number', payloadProp: 'max_tracks' }, { prop: 'mode', type: 'string' }, { prop: 'renderDimensions', type: 'object', payloadProp: 'render_dimensions', transform: createRenderDimensionsPayload }, { prop: 'trackSwitchOffMode', type: 'string', payloadProp: 'track_switch_off' }]);
+}
+
+/**
  * Create the Media Signaling payload included in an RSP connect message.
  * @param {boolean} dominantSpeaker - whether to enable the Dominant Speaker
  *   protocol or not
  * @param {boolean} networkQuality - whether to enable the Network Quality
  *   protocol or not
+ * @param {boolean} trackPriority - whether to enable the Track Priority
+ *   protocol or not
+ * @param {boolean} trackSwitchOff - whether to enable the Track Switch-Off
+ *   protocol or not.
  * @returns {object}
  */
-function createMediaSignalingPayload(dominantSpeaker, networkQuality) {
+function createMediaSignalingPayload(dominantSpeaker, networkQuality, trackPriority, trackSwitchOff) {
   var transports = { transports: [{ type: 'data-channel' }] };
   return Object.assign(dominantSpeaker
   // eslint-disable-next-line
   ? { active_speaker: transports } : {}, networkQuality
   // eslint-disable-next-line
-  ? { network_quality: transports } : {});
+  ? { network_quality: transports } : {}, trackPriority
+  // eslint-disable-next-line
+  ? { track_priority: transports } : {}, trackSwitchOff
+  // eslint-disable-next-line
+  ? { track_switch_off: transports } : {});
+}
+
+/**
+ * Create {@link VideoTrack.Dimensions} RSP payload.
+ * @param {VideoTrack.Dimensions} [dimensions]
+ * @returns {object}
+ */
+function createDimensionsPayload(dimensions) {
+  return createRSPPayload(dimensions, [{ prop: 'height', type: 'number' }, { prop: 'width', type: 'number' }]);
+}
+
+/**
+ * Create {@link VideoRenderDimensions} RSP payload.
+ * @param renderDimensions
+ * @returns {object}
+ */
+function createRenderDimensionsPayload(renderDimensions) {
+  var PRIORITY_HIGH = trackPriority.PRIORITY_HIGH,
+      PRIORITY_LOW = trackPriority.PRIORITY_LOW,
+      PRIORITY_STANDARD = trackPriority.PRIORITY_STANDARD;
+
+  return createRSPPayload(renderDimensions, [{ prop: PRIORITY_HIGH, type: 'object', transform: createDimensionsPayload }, { prop: PRIORITY_LOW, type: 'object', transform: createDimensionsPayload }, { prop: PRIORITY_STANDARD, type: 'object', transform: createDimensionsPayload }]);
+}
+
+/**
+ * Create an RSP payload for the given object.
+ * @param {object} object - object for which RSP payload is to be generated
+ * @param {Array<object>} propConversions - conversion rules for object properties;
+ *   they specify how object properties should be converted to their corresponding
+ *   RSP payload properties
+ * @returns {object}
+ */
+function createRSPPayload(object, propConversions) {
+  return propConversions.reduce(function (payload, _ref6) {
+    var prop = _ref6.prop,
+        type = _ref6.type,
+        _ref6$payloadProp = _ref6.payloadProp,
+        payloadProp = _ref6$payloadProp === undefined ? prop : _ref6$payloadProp,
+        _ref6$transform = _ref6.transform,
+        transform = _ref6$transform === undefined ? function (x) {
+      return x;
+    } : _ref6$transform;
+
+    return _typeof(object[prop]) === type ? Object.assign(_defineProperty({}, payloadProp, transform(object[prop])), payload) : payload;
+  }, {});
 }
 
 /**
@@ -20500,7 +23334,21 @@ function inRange(num, min, max) {
   return min <= num && num <= max;
 }
 
+/**
+ * returns true if given MediaStreamTrack is a screen share track
+ * @private
+ * @param {MediaStreamTrack} track
+ * @returns {boolean}
+ */
+function isChromeScreenShareTrack(track) {
+  // NOTE(mpatwardhan): Chrome creates screen share tracks with label like: "screen:69734272*"
+  // we will check for label that starts with "screen:D" where D being a digit.
+  var isChrome = util.guessBrowser() === 'chrome';
+  return isChrome && track.kind === 'video' && track.label && /^screen:[0-9]+/.test(track.label);
+}
+
 exports.constants = constants;
+exports.createBandwidthProfilePayload = createBandwidthProfilePayload;
 exports.createMediaSignalingPayload = createMediaSignalingPayload;
 exports.createSubscribePayload = createSubscribePayload;
 exports.asLocalTrack = asLocalTrack;
@@ -20513,6 +23361,8 @@ exports.flatMap = flatMap;
 exports.getUserAgent = getUserAgent;
 exports.hidePrivateProperties = hidePrivateProperties;
 exports.hidePrivateAndCertainPublicPropertiesInClass = hidePrivateAndCertainPublicPropertiesInClass;
+exports.isDeepEqual = isDeepEqual;
+exports.isNonArrayObject = isNonArrayObject;
 exports.inRange = inRange;
 exports.makeUUID = makeUUID;
 exports.oncePerTick = oncePerTick;
@@ -20525,10 +23375,10 @@ exports.legacyPromise = legacyPromise;
 exports.buildLogLevels = buildLogLevels;
 exports.trackClass = trackClass;
 exports.trackPublicationClass = trackPublicationClass;
-exports.validateLocalTrack = validateLocalTrack;
 exports.valueToJSON = valueToJSON;
 exports.withJitter = withJitter;
-},{"./constants":130}],133:[function(require,module,exports){
+exports.isChromeScreenShareTrack = isChromeScreenShareTrack;
+},{"./constants":142,"@twilio/webrtc/lib/util":16}],145:[function(require,module,exports){
 (function (global){
 'use strict';
 
@@ -20551,6 +23401,7 @@ var WS_CLOSE_NORMAL = 1000;
 
 var toplevel = global.window || global;
 var WebSocket = toplevel.WebSocket ? toplevel.WebSocket : require('ws');
+var util = require('../../util');
 
 /**
  * Publish events to the Insights gateway.
@@ -20592,6 +23443,9 @@ var InsightsPublisher = function (_EventEmitter) {
       _eventQueue: {
         value: []
       },
+      _readyToConnect: {
+        value: util.defer()
+      },
       _reconnectAttemptsLeft: {
         value: options.maxReconnectAttempts,
         writable: true
@@ -20605,30 +23459,48 @@ var InsightsPublisher = function (_EventEmitter) {
       }
     });
 
-    var self = _this;
+    _this._readyToConnect.promise.then(function (_ref) {
+      var roomSid = _ref.roomSid,
+          participantSid = _ref.participantSid;
 
-    _this.on('disconnected', function maybeReconnect(error) {
-      self._session = null;
-      if (error && self._reconnectAttemptsLeft > 0) {
-        self.emit('reconnecting');
-        reconnect(self, token, sdkName, sdkVersion, options);
-        return;
-      }
-      self.removeListener('disconnected', maybeReconnect);
+      var self = _this;
+      _this.on('disconnected', function maybeReconnect(error) {
+        self._session = null;
+        if (error && self._reconnectAttemptsLeft > 0) {
+          self.emit('reconnecting');
+          reconnect(self, token, sdkName, sdkVersion, roomSid, participantSid, options);
+          return;
+        }
+        self.removeListener('disconnected', maybeReconnect);
+      });
+      connect(_this, token, sdkName, sdkVersion, roomSid, participantSid, options);
+    }).catch(function () {
+      // ignore failures to connect
     });
-
-    connect(_this, token, sdkName, sdkVersion, options);
     return _this;
   }
 
   /**
-   * Publish an event to the Insights gateway.
-   * @private
-   * @param {*} event
+   * Start connecting to the Insights gateway.
+   * @param {string} roomSid
+   * @param {string} participantSid
+   * @returns {void}
    */
 
 
   _createClass(InsightsPublisher, [{
+    key: 'connect',
+    value: function connect(roomSid, participantSid) {
+      this._readyToConnect.resolve({ roomSid: roomSid, participantSid: participantSid });
+    }
+
+    /**
+     * Publish an event to the Insights gateway.
+     * @private
+     * @param {*} event
+     */
+
+  }, {
     key: '_publish',
     value: function _publish(event) {
       event.session = this._session;
@@ -20643,7 +23515,7 @@ var InsightsPublisher = function (_EventEmitter) {
   }, {
     key: 'disconnect',
     value: function disconnect() {
-      if (this._ws.readyState === this._WebSocket.CLOSING || this._ws.readyState === this._WebSocket.CLOSED) {
+      if (this._ws === null || this._ws.readyState === this._WebSocket.CLOSING || this._ws.readyState === this._WebSocket.CLOSED) {
         return false;
       }
 
@@ -20668,7 +23540,7 @@ var InsightsPublisher = function (_EventEmitter) {
   }, {
     key: 'publish',
     value: function publish(groupName, eventName, payload) {
-      if (this._ws.readyState === this._WebSocket.CLOSING || this._ws.readyState === this._WebSocket.CLOSED) {
+      if (this._ws !== null && (this._ws.readyState === this._WebSocket.CLOSING || this._ws.readyState === this._WebSocket.CLOSED)) {
         return false;
       }
 
@@ -20698,11 +23570,13 @@ var InsightsPublisher = function (_EventEmitter) {
  * @param {string} token
  * @param {string} sdkName
  * @param {string} sdkVersion
+ * @param {string} roomSid
+ * @param {string} participantSid
  * @param {InsightsPublisherOptions} options
  */
 
 
-function connect(publisher, token, sdkName, sdkVersion, options) {
+function connect(publisher, token, sdkName, sdkVersion, roomSid, participantSid, options) {
   publisher._connectTimestamp = Date.now();
   publisher._reconnectAttemptsLeft--;
   publisher._ws = new options.WebSocket(options.gateway);
@@ -20730,7 +23604,9 @@ function connect(publisher, token, sdkName, sdkVersion, options) {
     connectRequest.publisher = {
       name: sdkName,
       sdkVersion: sdkVersion,
-      userAgent: options.userAgent
+      userAgent: options.userAgent,
+      participantSid: participantSid,
+      roomSid: roomSid
     };
 
     ws.send(JSON.stringify(connectRequest));
@@ -20776,20 +23652,22 @@ function handleConnectResponse(publisher, response, options) {
  * @param {string} token
  * @param {string} sdkName
  * @param {string} sdkVersion
+ * @param {string} roomSid
+ * @param {string} participantSid
  * @param {InsightsPublisherOptions} options
  */
-function reconnect(publisher, token, sdkName, sdkVersion, options) {
+function reconnect(publisher, token, sdkName, sdkVersion, roomSid, participantSid, options) {
   var connectInterval = Date.now() - publisher._connectTimestamp;
   var timeToWait = options.reconnectIntervalMs - connectInterval;
 
   if (timeToWait > 0) {
     setTimeout(function () {
-      connect(publisher, token, sdkName, sdkVersion, options);
+      connect(publisher, token, sdkName, sdkVersion, roomSid, participantSid, options);
     }, timeToWait);
     return;
   }
 
-  connect(publisher, token, sdkName, sdkVersion, options);
+  connect(publisher, token, sdkName, sdkVersion, roomSid, participantSid, options);
 }
 
 /**
@@ -20818,7 +23696,8 @@ function reconnect(publisher, token, sdkName, sdkVersion, options) {
 
 module.exports = InsightsPublisher;
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"..":132,"events":155,"ws":151}],134:[function(require,module,exports){
+},{"..":144,"../../util":144,"events":168,"ws":164}],146:[function(require,module,exports){
+// eslint-disable-next-line no-warning-comments
 // TODO(mroberts): This should be described as implementing some
 // InsightsPublisher interface.
 'use strict';
@@ -20844,12 +23723,21 @@ var InsightsPublisher = function () {
   }
 
   /**
-   * Disconnect.
-   * @returns {boolean}
+   * Connect
+   * @returns {void}
    */
 
 
   _createClass(InsightsPublisher, [{
+    key: 'connect',
+    value: function connect() {}
+
+    /**
+     * Disconnect.
+     * @returns {boolean}
+     */
+
+  }, {
     key: 'disconnect',
     value: function disconnect() {
       if (this._connected) {
@@ -20875,7 +23763,7 @@ var InsightsPublisher = function () {
 }();
 
 module.exports = InsightsPublisher;
-},{}],135:[function(require,module,exports){
+},{}],147:[function(require,module,exports){
 /* eslint new-cap:0, no-console:0 */
 'use strict';
 
@@ -21177,7 +24065,7 @@ function validateLogLevels(levels) {
 }
 
 module.exports = Log;
-},{"./constants":130}],136:[function(require,module,exports){
+},{"./constants":142}],148:[function(require,module,exports){
 'use strict';
 
 var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }();
@@ -21644,7 +24532,7 @@ function unifiedPlanAddOrRewriteNewTrackIds(sdp, activeMidsToTrackIds, trackIdsB
         kind = _ref4[0],
         trackIds = _ref4[1];
 
-    var mediaSections = getMediaSections(sdp, kind);
+    var mediaSections = getMediaSections(sdp, kind, 'send(only|recv)');
     var newMids = mediaSections.map(getMidForMediaSection).filter(function (mid) {
       return !activeMidsToTrackIds.has(mid);
     });
@@ -21710,7 +24598,7 @@ exports.setSimulcast = setSimulcast;
 exports.unifiedPlanFilterLocalCodecs = unifiedPlanFilterLocalCodecs;
 exports.unifiedPlanAddOrRewriteNewTrackIds = unifiedPlanAddOrRewriteNewTrackIds;
 exports.unifiedPlanAddOrRewriteTrackIds = unifiedPlanAddOrRewriteTrackIds;
-},{"../":132,"./simulcast":138}],137:[function(require,module,exports){
+},{"../":144,"./simulcast":150}],149:[function(require,module,exports){
 'use strict';
 
 var RTCSessionDescription = require('@twilio/webrtc').RTCSessionDescription;
@@ -21925,7 +24813,7 @@ function addFmtpAttributeForRtxPt(mediaSection, rtxPt, pt) {
 }
 
 module.exports = workaround;
-},{"./":136,"@twilio/webrtc":3}],138:[function(require,module,exports){
+},{"./":148,"@twilio/webrtc":3}],150:[function(require,module,exports){
 'use strict';
 
 var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }();
@@ -22263,7 +25151,7 @@ function setSimulcastInMediaSection(section, sdpFormat, trackIdsToAttributes) {
  */
 
 module.exports = setSimulcastInMediaSection;
-},{"../":132}],139:[function(require,module,exports){
+},{"../":144}],151:[function(require,module,exports){
 'use strict';
 
 /**
@@ -22284,18 +25172,18 @@ var IdentityTrackMatcher = function () {
     key: 'match',
 
     /**
-     * Match a given MediaStreamTrack with its ID.
-     * @param {RTCTrackEvent} event
-     * @returns {Track.ID}
-     */
+    * Match a given MediaStreamTrack with its ID.
+    * @param {RTCTrackEvent} event
+    * @returns {Track.ID}
+    */
     value: function match(event) {
       return event.track.id;
     }
 
     /**
-     * Update the {@link IdentityTrackMatcher} with a new SDP.
-     * @param {string} sdp
-     */
+    * Update the {@link IdentityTrackMatcher} with a new SDP.
+    * @param {string} sdp
+    */
 
   }, {
     key: 'update',
@@ -22306,7 +25194,7 @@ var IdentityTrackMatcher = function () {
 }();
 
 module.exports = IdentityTrackMatcher;
-},{}],140:[function(require,module,exports){
+},{}],152:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -22371,7 +25259,7 @@ var MIDTrackMatcher = function () {
 }();
 
 module.exports = MIDTrackMatcher;
-},{"../":136}],141:[function(require,module,exports){
+},{"../":148}],153:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -22513,8 +25401,8 @@ var OrderedTrackMatcher = function () {
 }();
 
 module.exports = OrderedTrackMatcher;
-},{"../":136,"../../":132}],142:[function(require,module,exports){
-/* globals RTCPeerConnection, webkitRTCPeerConnection, mozRTCPeerConnection, navigator */
+},{"../":148,"../../":144}],154:[function(require,module,exports){
+/* globals RTCPeerConnection, webkitRTCPeerConnection, mozRTCPeerConnection, chrome, navigator */
 'use strict';
 
 var _require = require('@twilio/webrtc/lib/util'),
@@ -22539,15 +25427,25 @@ function isGetUserMediaSupported() {
 }
 
 /**
+ * Check whether the current browser is non-Chromium Edge.
+ * @param {string} browser
+ * @returns {boolean}
+ */
+function isNonChromiumEdge(browser) {
+  return browser === 'chrome' && /Edge/.test(navigator.userAgent) && (typeof chrome === 'undefined' || typeof chrome.runtime === 'undefined');
+}
+
+/**
  * Check if the current environment is supported by the SDK.
  * @returns {boolean}
  */
 function isSupported() {
-  return !!guessBrowser() && isGetUserMediaSupported() && isRTCPeerConnectionSupported();
+  var browser = guessBrowser();
+  return !!browser && !isNonChromiumEdge(browser) && isGetUserMediaSupported() && isRTCPeerConnectionSupported();
 }
 
 module.exports = isSupported;
-},{"@twilio/webrtc/lib/util":16}],143:[function(require,module,exports){
+},{"@twilio/webrtc/lib/util":16}],155:[function(require,module,exports){
 'use strict';
 
 /**
@@ -22563,13 +25461,17 @@ var Timeout = function () {
    * Construct a {@link Timeout}.
    * @param {function} fn - Function to call
    * @param {number} delay - Delay in milliseconds
+   * @param {boolean} [autoStart=true] - If true, then start the {@link Timeout}.
    */
   function Timeout(fn, delay) {
+    var autoStart = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : true;
+
     _classCallCheck(this, Timeout);
 
     Object.defineProperties(this, {
       _delay: {
-        value: delay
+        value: delay,
+        writable: true
       },
       _fn: {
         value: fn
@@ -22580,34 +25482,56 @@ var Timeout = function () {
       }
     });
 
-    this._start();
+    if (autoStart) {
+      this.start();
+    }
   }
 
   /**
-   * Start the {@link Timeout}.
-   * @private
+   * The {@link Timeout} delay in milliseconds.
+   * @property {number}
    */
 
 
   _createClass(Timeout, [{
-    key: '_start',
-    value: function _start() {
-      this._timeout = setTimeout(this._fn, this._delay);
+    key: 'setDelay',
+
+
+    /**
+     * Update the {@link Timeout} delay.
+     * @param {number} delay
+     * @returns {void}
+     */
+    value: function setDelay(delay) {
+      this._delay = delay;
     }
 
     /**
-     * Whether the {@link Timeout} is set.
-     * @property {boolean}
+     * Start the {@link Timeout}, if not already started.
+     * @returns {void}
      */
 
   }, {
-    key: 'clear',
+    key: 'start',
+    value: function start() {
+      var _this = this;
 
+      if (!this.isSet) {
+        this._timeout = setTimeout(function () {
+          var fn = _this._fn;
+          _this.clear();
+          fn();
+        }, this._delay);
+      }
+    }
 
     /**
      * Clear the {@link Timeout}.
      * @returns {void}
      */
+
+  }, {
+    key: 'clear',
     value: function clear() {
       clearTimeout(this._timeout);
       this._timeout = null;
@@ -22621,9 +25545,20 @@ var Timeout = function () {
   }, {
     key: 'reset',
     value: function reset() {
-      clearTimeout(this._timeout);
-      this._start();
+      this.clear();
+      this.start();
     }
+  }, {
+    key: 'delay',
+    get: function get() {
+      return this._delay;
+    }
+
+    /**
+     * Whether the {@link Timeout} is set.
+     * @property {boolean}
+     */
+
   }, {
     key: 'isSet',
     get: function get() {
@@ -22635,7 +25570,7 @@ var Timeout = function () {
 }();
 
 module.exports = Timeout;
-},{}],144:[function(require,module,exports){
+},{}],156:[function(require,module,exports){
 'use strict';
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
@@ -22796,11 +25731,11 @@ var TimeoutPromise = function (_EventEmitter) {
  */
 
 module.exports = TimeoutPromise;
-},{"./":132,"events":155}],145:[function(require,module,exports){
-'use strict';
-
+},{"./":144,"events":168}],157:[function(require,module,exports){
 // NOTE: Do not edit this file. This code is auto-generated. Contact the
 // Twilio SDK Team for more information.
+
+'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
@@ -22826,7 +25761,7 @@ exports.createTwilioError = function createTwilioError(code, message) {
 
 /**
  * @class AccessTokenInvalidError
- * @classdesc Raised whenever the AccessToken used for connecting to Room is invalid.
+ * @classdesc Raised whenever the AccessToken used for connecting to a Room is invalid.
  * @extends TwilioError
  * @property {number} code - 20101
  * @property {string} message - 'Invalid Access Token'
@@ -22849,7 +25784,7 @@ Object.defineProperty(TwilioErrorByCode, 20101, { value: AccessTokenInvalidError
 
 /**
  * @class AccessTokenHeaderInvalidError
- * @classdesc Raised whenever the AccessToken used for connecting to Room has an invalid header.
+ * @classdesc Raised whenever the AccessToken used for connecting to a Room has an invalid header.
  * @extends TwilioError
  * @property {number} code - 20102
  * @property {string} message - 'Invalid Access Token header'
@@ -22872,7 +25807,7 @@ Object.defineProperty(TwilioErrorByCode, 20102, { value: AccessTokenHeaderInvali
 
 /**
  * @class AccessTokenIssuerInvalidError
- * @classdesc Raised whenever the AccessToken used for connecting to Room contains an invalid issuer or subject.
+ * @classdesc Raised whenever the AccessToken used for connecting to a Room contains an invalid issuer or subject.
  * @extends TwilioError
  * @property {number} code - 20103
  * @property {string} message - 'Invalid Access Token issuer/subject'
@@ -22895,7 +25830,7 @@ Object.defineProperty(TwilioErrorByCode, 20103, { value: AccessTokenIssuerInvali
 
 /**
  * @class AccessTokenExpiredError
- * @classdesc Raised whenever the AccessToken used for connecting to Room has expired.
+ * @classdesc Raised whenever the AccessToken used for connecting, or reconnecting to a Room has expired.
  * @extends TwilioError
  * @property {number} code - 20104
  * @property {string} message - 'Access Token expired or expiration date invalid'
@@ -22918,7 +25853,7 @@ Object.defineProperty(TwilioErrorByCode, 20104, { value: AccessTokenExpiredError
 
 /**
  * @class AccessTokenNotYetValidError
- * @classdesc Raised whenever the AccessToken used for connecting to Room is not yet valid.
+ * @classdesc Raised whenever the AccessToken used for connecting to a Room is not yet valid.
  * @extends TwilioError
  * @property {number} code - 20105
  * @property {string} message - 'Access Token not yet valid'
@@ -22941,7 +25876,7 @@ Object.defineProperty(TwilioErrorByCode, 20105, { value: AccessTokenNotYetValidE
 
 /**
  * @class AccessTokenGrantsInvalidError
- * @classdesc Raised whenever the AccessToken used for connecting to Room has invalid grants.
+ * @classdesc Raised whenever the AccessToken used for connecting to a Room has invalid grants.
  * @extends TwilioError
  * @property {number} code - 20106
  * @property {string} message - 'Invalid Access Token grants'
@@ -22964,7 +25899,7 @@ Object.defineProperty(TwilioErrorByCode, 20106, { value: AccessTokenGrantsInvali
 
 /**
  * @class AccessTokenSignatureInvalidError
- * @classdesc Raised whenever the AccessToken used for connecting to Room has an invalid signature.
+ * @classdesc Raised whenever the AccessToken used for connecting to a Room has an invalid signature.
  * @extends TwilioError
  * @property {number} code - 20107
  * @property {string} message - 'Invalid Access Token signature'
@@ -23033,7 +25968,7 @@ Object.defineProperty(TwilioErrorByCode, 53001, { value: SignalingConnectionDisc
 
 /**
  * @class SignalingConnectionTimeoutError
- * @classdesc Raised whenever the signaling connection times out.
+ * @classdesc Raised when connection liveliness checks fail, or when the signaling session expires.
  * @extends TwilioError
  * @property {number} code - 53002
  * @property {string} message - 'Signaling connection timed out'
@@ -23631,7 +26566,7 @@ Object.defineProperty(TwilioErrorByCode, 53203, { value: ParticipantMaxTracksExc
 
 /**
  * @class ParticipantNotFoundError
- * @classdesc Raised whenever attempting operation on a non-existent Participant.
+ * @classdesc Raised whenever attempting an operation on a non-existent Participant.
  * @extends TwilioError
  * @property {number} code - 53204
  * @property {string} message - 'Participant not found'
@@ -23795,7 +26730,7 @@ Object.defineProperty(TwilioErrorByCode, 53304, { value: TrackNameIsDuplicatedEr
  * @classdesc The server does not have enough resources available to create a new Track.
  * @extends TwilioError
  * @property {number} code - 53305
- * @property {string} message - 'The server has reached capacity and cannot fulfill this request.'
+ * @property {string} message - 'The server has reached capacity and cannot fulfill this request'
  */
 
 var TrackServerTrackCapacityReachedError = function (_TwilioError43) {
@@ -23804,7 +26739,7 @@ var TrackServerTrackCapacityReachedError = function (_TwilioError43) {
   function TrackServerTrackCapacityReachedError() {
     _classCallCheck(this, TrackServerTrackCapacityReachedError);
 
-    return _possibleConstructorReturn(this, (TrackServerTrackCapacityReachedError.__proto__ || Object.getPrototypeOf(TrackServerTrackCapacityReachedError)).call(this, 53305, 'The server has reached capacity and cannot fulfill this request.'));
+    return _possibleConstructorReturn(this, (TrackServerTrackCapacityReachedError.__proto__ || Object.getPrototypeOf(TrackServerTrackCapacityReachedError)).call(this, 53305, 'The server has reached capacity and cannot fulfill this request'));
   }
 
   return TrackServerTrackCapacityReachedError;
@@ -23930,10 +26865,10 @@ Object.defineProperty(TwilioErrorByCode, 53404, { value: MediaNoSupportedCodecEr
 
 /**
  * @class MediaConnectionError
- * @classdesc Raised by the Client or Server whenever a media connection fails.
+ * @classdesc Raised by the Client or Server whenever a media connection fails or raised by the Client whenever it detects that media has stopped flowing.
  * @extends TwilioError
  * @property {number} code - 53405
- * @property {string} message - 'Media connection failed'
+ * @property {string} message - 'Media connection failed or Media activity ceased'
  */
 
 var MediaConnectionError = function (_TwilioError49) {
@@ -23942,7 +26877,7 @@ var MediaConnectionError = function (_TwilioError49) {
   function MediaConnectionError() {
     _classCallCheck(this, MediaConnectionError);
 
-    return _possibleConstructorReturn(this, (MediaConnectionError.__proto__ || Object.getPrototypeOf(MediaConnectionError)).call(this, 53405, 'Media connection failed'));
+    return _possibleConstructorReturn(this, (MediaConnectionError.__proto__ || Object.getPrototypeOf(MediaConnectionError)).call(this, 53405, 'Media connection failed or Media activity ceased'));
   }
 
   return MediaConnectionError;
@@ -23952,6 +26887,29 @@ exports.MediaConnectionError = MediaConnectionError;
 Object.defineProperty(TwilioErrorByCode, 53405, { value: MediaConnectionError });
 
 /**
+ * @class MediaDTLSTransportFailedError
+ * @classdesc There was a problem while negotiating with the remote DTLS peer. Therefore the Participant will not be able to publish or subscribe to Tracks.
+ * @extends TwilioError
+ * @property {number} code - 53407
+ * @property {string} message - 'Media connection failed due to DTLS handshake failure'
+ */
+
+var MediaDTLSTransportFailedError = function (_TwilioError50) {
+  _inherits(MediaDTLSTransportFailedError, _TwilioError50);
+
+  function MediaDTLSTransportFailedError() {
+    _classCallCheck(this, MediaDTLSTransportFailedError);
+
+    return _possibleConstructorReturn(this, (MediaDTLSTransportFailedError.__proto__ || Object.getPrototypeOf(MediaDTLSTransportFailedError)).call(this, 53407, 'Media connection failed due to DTLS handshake failure'));
+  }
+
+  return MediaDTLSTransportFailedError;
+}(TwilioError);
+
+exports.MediaDTLSTransportFailedError = MediaDTLSTransportFailedError;
+Object.defineProperty(TwilioErrorByCode, 53407, { value: MediaDTLSTransportFailedError });
+
+/**
  * @class ConfigurationAcquireFailedError
  * @classdesc Raised whenever the Client is unable to acquire configuration information from the Server.
  * @extends TwilioError
@@ -23959,8 +26917,8 @@ Object.defineProperty(TwilioErrorByCode, 53405, { value: MediaConnectionError })
  * @property {string} message - 'Unable to acquire configuration'
  */
 
-var ConfigurationAcquireFailedError = function (_TwilioError50) {
-  _inherits(ConfigurationAcquireFailedError, _TwilioError50);
+var ConfigurationAcquireFailedError = function (_TwilioError51) {
+  _inherits(ConfigurationAcquireFailedError, _TwilioError51);
 
   function ConfigurationAcquireFailedError() {
     _classCallCheck(this, ConfigurationAcquireFailedError);
@@ -23982,8 +26940,8 @@ Object.defineProperty(TwilioErrorByCode, 53500, { value: ConfigurationAcquireFai
  * @property {string} message - 'Unable to acquire TURN credentials'
  */
 
-var ConfigurationAcquireTurnFailedError = function (_TwilioError51) {
-  _inherits(ConfigurationAcquireTurnFailedError, _TwilioError51);
+var ConfigurationAcquireTurnFailedError = function (_TwilioError52) {
+  _inherits(ConfigurationAcquireTurnFailedError, _TwilioError52);
 
   function ConfigurationAcquireTurnFailedError() {
     _classCallCheck(this, ConfigurationAcquireTurnFailedError);
@@ -23996,7 +26954,7 @@ var ConfigurationAcquireTurnFailedError = function (_TwilioError51) {
 
 exports.ConfigurationAcquireTurnFailedError = ConfigurationAcquireTurnFailedError;
 Object.defineProperty(TwilioErrorByCode, 53501, { value: ConfigurationAcquireTurnFailedError });
-},{"./twilioerror":146}],146:[function(require,module,exports){
+},{"./twilioerror":158}],158:[function(require,module,exports){
 'use strict';
 
 /**
@@ -24068,7 +27026,113 @@ var TwilioError = function (_Error) {
 }(Error);
 
 module.exports = TwilioError;
-},{}],147:[function(require,module,exports){
+},{}],159:[function(require,module,exports){
+'use strict';
+
+var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
+
+var _require = require('./'),
+    isNonArrayObject = _require.isNonArrayObject;
+
+var _require2 = require('./constants'),
+    E = _require2.typeErrors,
+    subscriptionMode = _require2.subscriptionMode,
+    trackPriority = _require2.trackPriority,
+    trackSwitchOffMode = _require2.trackSwitchOffMode;
+
+/**
+ * Validate the {@link BandwidthProfileOptions} object.
+ * @param {BandwidthProfileOptions} bandwidthProfile
+ * @returns {?Error} - null if valid, Error if not.
+ */
+
+
+function validateBandwidthProfile(bandwidthProfile) {
+  var error = validateObject(bandwidthProfile, 'options.bandwidthProfile');
+  if (!bandwidthProfile || error) {
+    return error;
+  }
+  error = validateObject(bandwidthProfile.video, 'options.bandwidthProfile.video', [{ prop: 'dominantSpeakerPriority', values: Object.values(trackPriority) }, { prop: 'maxSubscriptionBitrate', type: 'number' }, { prop: 'maxTracks', type: 'number' }, { prop: 'mode', values: Object.values(subscriptionMode) }, { prop: 'trackSwitchOffMode', values: Object.values(trackSwitchOffMode) }]);
+  return error || (bandwidthProfile.video ? validateRenderDimensions(bandwidthProfile.video.renderDimensions) : null);
+}
+
+/**
+ * Throw if the given track is not a {@link LocalAudioTrack}, a
+ * {@link LocalVideoTrack} or a MediaStreamTrack.
+ * @param {*} track
+ * @param {object} options
+ */
+function validateLocalTrack(track, options) {
+  if (!(track instanceof options.LocalAudioTrack || track instanceof options.LocalDataTrack || track instanceof options.LocalVideoTrack || track instanceof options.MediaStreamTrack)) {
+    /* eslint new-cap:0 */
+    throw E.INVALID_TYPE('track', 'LocalAudioTrack, LocalVideoTrack, LocalDataTrack, or MediaStreamTrack');
+  }
+}
+
+/**
+ * Validate an object. An object is valid if it is undefined or a non-null, non-array
+ * object whose properties satisfy the specified data-type or value-range requirements.
+ * @param {object} object - the object to be validated
+ * @param {string} name - the object name to be used to build the error message, if invalid
+ * @param {Array<object>} [propChecks] - optional data-type or value-range requirements
+ *   for the object's properties
+ * @returns {?Error} - null if object is valid, Error if not
+ */
+function validateObject(object, name) {
+  var propChecks = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : [];
+
+  // NOTE(mmalavalli): We determine that an undefined object is valid because this
+  // means the parent object does not contain this object as a property, which is
+  // a valid scenario.
+  if (typeof object === 'undefined') {
+    return null;
+  }
+  // NOTE(mmalavalli): We determine that if the object is null, or an Array, or
+  // any other non-object type, then it is invalid.
+  if (object === null || !isNonArrayObject(object)) {
+    return E.INVALID_TYPE(name, 'object');
+  }
+  // NOTE(mmalavalli): We determine that the object is invalid if at least one of
+  // its properties does not satisfy its data-type or value-range requirement.
+  return propChecks.reduce(function (error, _ref) {
+    var prop = _ref.prop,
+        type = _ref.type,
+        values = _ref.values;
+
+    if (error || !(prop in object)) {
+      return error;
+    }
+    var value = object[prop];
+    if (type && (typeof value === 'undefined' ? 'undefined' : _typeof(value)) !== type) {
+      return E.INVALID_TYPE(name + '.' + prop, type);
+    }
+    if (type === 'number' && isNaN(value)) {
+      return E.INVALID_TYPE(name + '.' + prop, type);
+    }
+    if (Array.isArray(values) && !values.includes(value)) {
+      return E.INVALID_VALUE(name + '.' + prop, values);
+    }
+    return error;
+  }, null);
+}
+
+/**
+ * Validate the {@link VideoRenderDimensions} object.
+ * @param {VideoRenderDimensions} renderDimensions
+ * @returns {?Error} - null if valid, Error if not.
+ */
+function validateRenderDimensions(renderDimensions) {
+  var name = 'options.bandwidthProfile.video.renderDimensions';
+  var error = validateObject(renderDimensions, name);
+  return renderDimensions ? error || Object.values(trackPriority).reduce(function (error, prop) {
+    return error || validateObject(renderDimensions[prop], name + '.' + prop, [{ prop: 'height', type: 'number' }, { prop: 'width', type: 'number' }]);
+  }, null) : error;
+}
+
+exports.validateBandwidthProfile = validateBandwidthProfile;
+exports.validateLocalTrack = validateLocalTrack;
+exports.validateObject = validateObject;
+},{"./":144,"./constants":142}],160:[function(require,module,exports){
 /* globals webkitAudioContext, AudioContext */
 'use strict';
 
@@ -24167,7 +27231,7 @@ var AudioContextFactory = function () {
 }();
 
 module.exports = new AudioContextFactory();
-},{}],148:[function(require,module,exports){
+},{}],161:[function(require,module,exports){
 'use strict';
 
 /**
@@ -24230,7 +27294,7 @@ function detectSilence(audioContext, stream, timeout) {
 }
 
 module.exports = detectSilence;
-},{}],149:[function(require,module,exports){
+},{}],162:[function(require,module,exports){
 'use strict';
 
 var detectSilence = require('./detectsilence');
@@ -24303,30 +27367,31 @@ to get a new one, but we\'ve run out of retries; returning it anyway.');
 }
 
 module.exports = workaround;
-},{"./audiocontext":147,"./detectsilence":148}],150:[function(require,module,exports){
+},{"./audiocontext":160,"./detectsilence":161}],163:[function(require,module,exports){
 module.exports={
-  "_from": "twilio-video@2.0.0-beta12",
-  "_id": "twilio-video@2.0.0-beta12",
+  "_from": "twilio-video@2.3.0",
+  "_id": "twilio-video@2.3.0",
   "_inBundle": false,
-  "_integrity": "sha512-S7yRUoNpuNzZnkeBIRWkcS5/7RngI4TtePNrHFz/QxMUVBRcF8rClZVjLC7wvwZVA8pG3HxYYvsiGWNSXiFLPg==",
+  "_integrity": "sha512-03tOkLWamHMLV8Z6imcPG9A1RFOYuSNEn5pbUEa/RhJWgPhmeffwPqOL8tw96md8Byum3vLUFUo5kvEt4NhK1w==",
   "_location": "/twilio-video",
   "_phantomChildren": {},
   "_requested": {
     "type": "version",
     "registry": true,
-    "raw": "twilio-video@2.0.0-beta12",
+    "raw": "twilio-video@2.3.0",
     "name": "twilio-video",
     "escapedName": "twilio-video",
-    "rawSpec": "2.0.0-beta12",
+    "rawSpec": "2.3.0",
     "saveSpec": null,
-    "fetchSpec": "2.0.0-beta12"
+    "fetchSpec": "2.3.0"
   },
   "_requiredBy": [
+    "#USER",
     "/"
   ],
-  "_resolved": "https://registry.npmjs.org/twilio-video/-/twilio-video-2.0.0-beta12.tgz",
-  "_shasum": "e22e530eb361cb859da717a97fb517c3350cf2e4",
-  "_spec": "twilio-video@2.0.0-beta12",
+  "_resolved": "https://registry.npmjs.org/twilio-video/-/twilio-video-2.3.0.tgz",
+  "_shasum": "a96574bece5b1d2897a0b76924dbb29fc8c05938",
+  "_spec": "twilio-video@2.3.0",
   "_where": "/Users/pnash/projects/mediadevices-camera-selection",
   "author": {
     "name": "Mark Andrus Roberts",
@@ -24348,10 +27413,15 @@ module.exports={
     {
       "name": "Manjesh Malavalli",
       "email": "mmalavalli@twilio.com"
+    },
+    {
+      "name": "Makarand Patwardhan",
+      "email": "mpatwardhan@twilio.com"
     }
   ],
   "dependencies": {
-    "@twilio/webrtc": "4.1.0",
+    "@twilio/webrtc": "4.2.0",
+    "backoff": "^2.5.0",
     "ws": "^3.3.1",
     "xmlhttprequest": "^1.8.0"
   },
@@ -24367,22 +27437,34 @@ module.exports={
     "browserify": "^14.3.0",
     "cheerio": "^0.22.0",
     "chromedriver": "2.28.0",
+    "cors": "^2.8.5",
     "electron": "^5.0.1",
     "envify": "^4.0.0",
-    "eslint": "^4.9.0",
+    "eslint": "^6.2.1",
+    "eslint-config-standard": "^14.0.0",
+    "eslint-plugin-import": "^2.18.2",
+    "eslint-plugin-node": "^9.1.0",
+    "eslint-plugin-promise": "^4.2.1",
+    "eslint-plugin-standard": "^4.0.1",
     "express": "^4.16.2",
     "geckodriver": "1.4.0",
     "ink-docstrap": "^1.3.2",
+    "inquirer": "^7.0.0",
+    "is-docker": "^2.0.0",
     "istanbul": "^0.4.5",
     "jsdoc": "^3.5.5",
+    "json-loader": "^0.5.7",
     "karma": "^1.6.0",
     "karma-browserify": "^5.1.1",
     "karma-chrome-launcher": "^2.0.0",
+    "karma-edgium-launcher": "^4.0.0-0",
     "karma-electron": "^6.1.0",
     "karma-firefox-launcher": "^1.0.1",
+    "karma-htmlfile-reporter": "^0.3.8",
+    "karma-junit-reporter": "^1.2.0",
     "karma-mocha": "^1.3.0",
     "karma-safari-launcher": "^1.0.0",
-    "karma-spec-reporter": "^0.0.31",
+    "karma-spec-reporter": "0.0.32",
     "mocha": "^3.2.0",
     "npm-run-all": "^4.0.2",
     "puppeteer": "^1.11.0",
@@ -24390,6 +27472,7 @@ module.exports={
     "requirejs": "^2.3.3",
     "rimraf": "^2.6.1",
     "selenium-webdriver": "3.3.0",
+    "simple-git": "^1.126.0",
     "sinon": "^4.0.1",
     "travis-multirunner": "^4.0.0",
     "ts-node": "4.0.1",
@@ -24399,6 +27482,7 @@ module.exports={
     "uglify-js": "^2.8.22",
     "vinyl-fs": "^2.4.4",
     "vinyl-source-stream": "^1.1.0",
+    "watchify": "^3.11.1",
     "webrtc-adapter": "^4.1.1"
   },
   "engines": {
@@ -24422,15 +27506,16 @@ module.exports={
   },
   "scripts": {
     "build": "npm-run-all clean lint docs cover test:integration build:es5 build:js build:min.js test:umd",
+    "build:docker": "npm-run-all clean lint docs cover test:integration:travis build:es5 build:js build:min.js",
     "build:es5": "rimraf ./es5 && babel lib -d es5",
     "build:js": "node ./scripts/build.js ./src/twilio-video.js ./LICENSE.md ./dist/twilio-video.js",
     "build:min.js": "uglifyjs ./dist/twilio-video.js -o ./dist/twilio-video.min.js --comments \"/^! twilio-video.js/\" -b beautify=false,ascii_only=true",
     "build:quick": "npm-run-all clean lint docs build:es5 build:js build:min.js",
-    "build:travis": "npm-run-all clean lint docs cover test:integration:travis build:es5 build:js build:min.js test:umd test:framework",
+    "build:travis": "npm-run-all clean lint docs cover build:es5 build:js build:min.js test:umd test:framework",
     "clean": "rimraf ./coverage ./es5 ./dist",
     "cover": "istanbul cover node_modules/mocha/bin/_mocha -- ./test/unit/index.js",
     "docs": "node ./scripts/docs.js ./dist/docs",
-    "lint": "eslint ./lib ./test/*.js ./test/framework/*.js ./test/lib/*.js ./test/integration/** ./test/unit/**",
+    "lint": "eslint ./lib ./test/*.js ./docker/**/*.js ./test/framework/*.js ./test/lib/*.js ./test/integration/** ./test/unit/**",
     "test": "npm-run-all test:unit test:integration",
     "test:crossbrowser": "npm-run-all test:crossbrowser:*",
     "test:crossbrowser:build": "npm-run-all test:crossbrowser:build:*",
@@ -24441,13 +27526,13 @@ module.exports={
     "test:crossbrowser:test": "cd ./test/crossbrowser && mocha --compilers ts:ts-node/register test/integration/spec/**/*.ts",
     "test:framework": "npm-run-all test:framework:angular test:framework:no-framework test:framework:react",
     "test:framework:angular": "npm-run-all test:framework:angular:*",
-    "test:framework:angular:install": "cd ./test/framework/twilio-video-angular && rimraf ./node_modules && npm install",
+    "test:framework:angular:install": "cd ./test/framework/twilio-video-angular && rimraf ./node_modules package-lock.json && npm install",
     "test:framework:angular:run": "mocha ./test/framework/twilio-video-angular.js",
     "test:framework:no-framework": "npm-run-all test:framework:no-framework:*",
     "test:framework:no-framework:run": "mocha ./test/framework/twilio-video-no-framework.js",
     "test:framework:react": "npm-run-all test:framework:react:*",
     "test:framework:react:build": "cd ./test/framework/twilio-video-react && npm run build",
-    "test:framework:react:install": "cd ./test/framework/twilio-video-react && rimraf ./node_modules && npm install",
+    "test:framework:react:install": "cd ./test/framework/twilio-video-react && rimraf ./node_modules package-lock.json && npm install",
     "test:framework:react:run": "mocha ./test/framework/twilio-video-react.js",
     "test:framework:react:test": "node ./scripts/framework.js twilio-video-react",
     "test:integration": "node ./scripts/karma.js karma/integration.conf.js",
@@ -24467,23 +27552,23 @@ module.exports={
     "test:unit": "mocha ./test/unit/index.js"
   },
   "title": "Twilio Video",
-  "version": "2.0.0-beta12"
+  "version": "2.3.0"
 }
 
-},{}],151:[function(require,module,exports){
+},{}],164:[function(require,module,exports){
 module.exports = WebSocket;
 
-},{}],152:[function(require,module,exports){
+},{}],165:[function(require,module,exports){
 exports.XMLHttpRequest = XMLHttpRequest;
 
-},{}],153:[function(require,module,exports){
+},{}],166:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],154:[function(require,module,exports){
+},{}],167:[function(require,module,exports){
 (function (process,global){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -25073,7 +28158,7 @@ function hasOwnProperty(obj, prop) {
 }
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./support/isBuffer":153,"_process":21,"inherits":20}],155:[function(require,module,exports){
+},{"./support/isBuffer":166,"_process":30,"inherits":26}],168:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -25598,7 +28683,7 @@ function functionBindPolyfill(context) {
   };
 }
 
-},{}],156:[function(require,module,exports){
+},{}],169:[function(require,module,exports){
 'use strict';
 
 var Video = require('twilio-video');
@@ -25665,6 +28750,13 @@ function gotDevices(mediaDevices) {
   });
 }
 
+// 
+function stopTracks(tracks) {
+  tracks.forEach(function(track) {
+    if (track) { track.stop(); }
+  })
+}
+
 // When we are about to transition away from this page, disconnect
 // from the room, if joined.
 window.addEventListener('beforeunload', leaveRoomIfJoined);
@@ -25685,9 +28777,7 @@ $.getJSON('/token', function(data) {
     log("Joining room '" + roomName + "'...");
     var connectOptions = {
       name: roomName,
-      audio: false,
-      video: true //,
-      // logLevel: 'debug'
+      logLevel: 'debug'
     };
 
     if (previewTracks) {
@@ -25710,20 +28800,20 @@ $.getJSON('/token', function(data) {
 
 function updateVideoDevice(event) {
   const select = event.target;
-  const localParticipant = room.localParticipant;
+  const localParticipant = activeRoom.localParticipant;
   if (select.value !== '') {
+    const tracks = Array.from(localParticipant.videoTracks.values()).map(
+      function(trackPublication) {
+        return trackPublication.track;
+      }
+    );
+    localParticipant.unpublishTracks(tracks);
+    log(localParticipant.identity + ' removed track: ' + tracks[0].kind);
+    detachTracks(tracks);
+    stopTracks(tracks);
     Video.createLocalVideoTrack({
       deviceId: { exact: select.value }
     }).then(function(localVideoTrack) {
-      const tracks = Array.from(localParticipant.videoTracks.values()).map(
-        function(trackPublication) {
-          return trackPublication.track;
-        }
-      );
-      localParticipant.unpublishTracks(tracks);
-      log(localParticipant.identity + ' removed track: ' + tracks[0].kind);
-      detachTracks(tracks);
-
       localParticipant.publishTrack(localVideoTrack);
       log(localParticipant.identity + ' added track: ' + localVideoTrack.kind);
       const previewContainer = document.getElementById('local-media');
@@ -25835,4 +28925,4 @@ function leaveRoomIfJoined() {
   }
 }
 
-},{"twilio-video":35}]},{},[156]);
+},{"twilio-video":44}]},{},[169]);

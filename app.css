@@ -11,8 +11,8 @@ html {
 body {
   font-family: Helvetica, Arial, sans-serif;
   min-height: 100%;
-  display: grid;
-  grid-template-rows: 1fr auto;
+  display: flex;
+  flex-direction: column;
 }
 
 header {
@@ -23,12 +23,26 @@ header {
 main {
   background: #ffffff;
   min-height: 80vh;
+  flex-grow: 1;
 }
 
 .controls {
   text-align: center;
   padding: 0.5em 0;
   background: #333e5a;
+}
+
+.controls {
+  color: #fff;
+}
+.controls p {
+  margin: 0;
+}
+.controls > div {
+  margin-bottom: 0.5em;
+}
+.controls > div:last-child {
+  margin-bottom: 0;
 }
 
 video {

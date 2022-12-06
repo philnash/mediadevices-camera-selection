@@ -34,7 +34,7 @@
     "concurrently": "^6.0.1",
     "copyfiles": "^2.4.1",
     "rimraf": "^3.0.2",
-    "serve": "^11.3.2",
+    "serve": "^14.1.2",
     "watchify": "^4.0.0"
   }
 }
